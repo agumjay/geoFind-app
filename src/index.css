@@ -1,0 +1,4 @@
+import GeoFind from "./geoFind.jsx";
+export default function App() {
+  return <GeoFind />;
+}
