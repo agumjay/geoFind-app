@@ -1,5 +1,5 @@
 // geoFind service worker: cache app shell, runtime-cache map tiles & assets.
-const CACHE = "geofind-v1";
+const CACHE = "geofind-v2";
 const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/favicon.svg"];
 
 self.addEventListener("install", (e) => {

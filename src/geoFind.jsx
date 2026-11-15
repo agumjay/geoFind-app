@@ -197,7 +197,26 @@ function useInstallPrompt() {
   return { installed, canPrompt: !!deferred, install };
 }
 
-function Navbar({ installed, onInstall, tracking }) {
+// ---- Theme (light / dark) --------------------------------------------------
+const THEME_KEY = "geofind_theme_v1";
+function useTheme() {
+  const [theme, setTheme] = useState(() => {
+    try {
+      const saved = localStorage.getItem(THEME_KEY);
+      if (saved === "light" || saved === "dark") return saved;
+    } catch { /* ignore */ }
+    return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  });
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "dark" ? "#0b1220" : "#2563eb");
+    try { localStorage.setItem(THEME_KEY, theme); } catch { /* ignore */ }
+  }, [theme]);
+  const toggle = useCallback(() => setTheme((t) => (t === "dark" ? "light" : "dark")), []);
+  return { theme, toggle };
+}
+
+function Navbar({ installed, onInstall, tracking, theme, onToggleTheme }) {
   return (
     <nav className="gf-nav">
       <div className="gf-nav-brand">
@@ -206,6 +225,19 @@ function Navbar({ installed, onInstall, tracking }) {
       </div>
       <div className="gf-nav-right">
         <span className={`gf-live ${tracking ? "on" : ""}`}>{tracking ? "Live" : "Idle"}</span>
+        <button className="gf-theme" onClick={onToggleTheme}
+                aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+                title={theme === "dark" ? "Light mode" : "Dark mode"}>
+          {theme === "dark" ? (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+            </svg>
+          ) : (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+            </svg>
+          )}
+        </button>
       {!installed && (
         <button className="gf-install" onClick={onInstall}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -254,13 +286,13 @@ const MAP_STYLES = {
   },
   light: {
     label: "Light", swatch: "#e5e7eb",
-    url: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
-    attribution: "&copy; OpenStreetMap, &copy; CARTO", maxZoom: 20,
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    attribution: "Tiles &copy; Esri", maxZoom: 16,
   },
   dark: {
     label: "Dark", swatch: "#1f2937",
-    url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-    attribution: "&copy; OpenStreetMap, &copy; CARTO", maxZoom: 20,
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    attribution: "Tiles &copy; Esri", maxZoom: 16,
   },
 };
 const STYLE_KEY = "geofind_map_style_v1";
@@ -359,7 +391,7 @@ function MapView({ points, latest, geofence, insideGeofence, playbackPoint, show
         key={styleId}
         attribution={st.attribution}
         url={st.url}
-        maxZoom={st.maxZoom}
+        maxZoom={20}
         maxNativeZoom={st.maxZoom}
       />
       <FlyToLatest latest={latest} follow={follow} recenterKey={recenterKey} />
@@ -516,6 +548,7 @@ export default function GeoFind() {
   const [alert, setAlert] = useState(null);
   const [playbackIdx, setPlaybackIdx] = useState(0);
   const { installed, install } = useInstallPrompt();
+  const { theme, toggle: toggleTheme } = useTheme();
   const [sheetOpen, setSheetOpen] = useState(true);
   const [styleId, setStyleId] = useState(() => {
     try {
@@ -574,7 +607,7 @@ export default function GeoFind() {
   return (
     <>
       <style>{STYLES}</style>
-      <Navbar installed={installed} onInstall={handleInstall} tracking={tracking} />
+      <Navbar installed={installed} onInstall={handleInstall} tracking={tracking} theme={theme} onToggleTheme={toggleTheme} />
       <div className="gf-shell">
         <div className="gf-map-wrap">
                    <MapView
@@ -747,6 +780,55 @@ const STYLES = `
   .gf-playback { display:flex; gap:10px; align-items:center; font-size:12px; font-weight:500; color:#475569; margin-bottom:16px; }
   .gf-playback input[type=range] { flex:1; accent-color:var(--primary); min-width:0; height:28px; }
   .gf-playback button { border:none; background:#e2e8f0; min-height:32px; padding:0 12px; border-radius:8px; cursor:pointer; font-weight:600; color:#334155; }
+
+  .gf-theme {
+    width:40px; height:40px; display:flex; align-items:center; justify-content:center; border:1px solid var(--line);
+    border-radius:10px; background:transparent; color:#334155; cursor:pointer; transition: background .2s;
+  }
+  .gf-theme:hover { background:#f1f5f9; }
+
+  /* ---------- Dark theme ---------- */
+  :root[data-theme="dark"] body { background:#0b1220; }
+  :root[data-theme="dark"] {
+    --ink:#f1f5f9; --muted:#94a3b8; --line:#273449; --card:#111a2c; color-scheme: dark;
+  }
+  [data-theme="dark"] .gf-shell { background:#0b1220; }
+  [data-theme="dark"] .gf-nav { background:rgba(15,23,42,.92); }
+  [data-theme="dark"] .gf-side { background:#0f172a; box-shadow:-8px 0 30px rgba(0,0,0,.4); }
+  [data-theme="dark"] .gf-handle { background:#0f172a; }
+  [data-theme="dark"] .gf-handle i { background:#475569; }
+  [data-theme="dark"] .gf-live, [data-theme="dark"] .gf-badge.off { background:#1e293b; color:#94a3b8; }
+  [data-theme="dark"] .gf-live.on, [data-theme="dark"] .gf-badge.on { background:#14532d; color:#bbf7d0; }
+  [data-theme="dark"] .gf-theme { color:#e2e8f0; }
+  [data-theme="dark"] .gf-theme:hover { background:#1e293b; }
+  [data-theme="dark"] .gf-controlbar button { background:#1e293b; color:#e2e8f0; }
+  [data-theme="dark"] .gf-controlbar button:hover { background:#273449; }
+  [data-theme="dark"] .gf-controlbar button.primary { background:var(--primary); color:#fff; }
+  [data-theme="dark"] .gf-controlbar button.danger { background:#ef4444; color:#fff; }
+  [data-theme="dark"] .gf-toggle { color:#cbd5e1; }
+  [data-theme="dark"] .gf-tile, [data-theme="dark"] .gf-row, [data-theme="dark"] .gf-spark { background:#0f172a; }
+  [data-theme="dark"] .gf-geofence.in { background:#052e16; border-color:#166534; }
+  [data-theme="dark"] .gf-geofence.out { background:#450a0a; border-color:#991b1b; }
+  [data-theme="dark"] .gf-warn { background:#422006; color:#fde68a; }
+  [data-theme="dark"] .gf-error { background:#450a0a; color:#fecaca; }
+  [data-theme="dark"] .gf-playback { color:#cbd5e1; }
+  [data-theme="dark"] .gf-playback button { background:#273449; color:#e2e8f0; }
+  [data-theme="dark"] .gf-privacy { background:#0c1a33; border-color:#1e3a8a; color:#cbd5e1; }
+  [data-theme="dark"] .gf-privacy strong { color:#93c5fd; }
+  [data-theme="dark"] .gf-ctl, [data-theme="dark"] .gf-styles { background:#1e293b; color:#e2e8f0; }
+  [data-theme="dark"] .gf-ctl:hover:not(:disabled) { background:#273449; }
+  [data-theme="dark"] .gf-ctl.active { background:var(--primary); color:#fff; }
+  [data-theme="dark"] .gf-style { color:#e2e8f0; }
+  [data-theme="dark"] .gf-style:hover { background:#273449; }
+  [data-theme="dark"] .gf-style.sel { background:#1e3a8a; color:#dbeafe; }
+  [data-theme="dark"] .gf-style i { border-color:#1e293b; box-shadow:0 0 0 1px #475569; }
+  [data-theme="dark"] .gf-nav-brand, [data-theme="dark"] .gf-side h1 { color:#f1f5f9; }
+  [data-theme="dark"] .leaflet-popup-content-wrapper, [data-theme="dark"] .leaflet-popup-tip { background:#1e293b; color:#e2e8f0; }
+  [data-theme="dark"] .leaflet-control-zoom a { background:#1e293b; color:#e2e8f0; border-color:#334155; }
+  [data-theme="dark"] .leaflet-control-attribution { background:rgba(15,23,42,.8); color:#94a3b8; }
+  [data-theme="dark"] .leaflet-control-attribution a { color:#93c5fd; }
+  [data-theme="dark"] .recharts-default-tooltip { background:#1e293b !important; border-color:#334155 !important; }
+  [data-theme="dark"] .gf-spark small { color:#94a3b8 !important; }
 
   /* ---------- Map controls ---------- */
   .gf-mapctl { position:absolute; top:12px; right:12px; z-index:1000; display:flex; flex-direction:row-reverse; gap:8px; align-items:flex-start; }
