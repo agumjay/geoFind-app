@@ -56,6 +56,29 @@ function useHybridTracking() {
   const [distanceKm, setDistanceKm] = useState(0);
 
   const watchIdRef = useRef(null);
+  const wakeLockRef = useRef(null);
+
+  // Keep the screen awake while tracking (browsers pause GPS when the screen locks).
+  useEffect(() => {
+    if (!tracking || !("wakeLock" in navigator)) return;
+    let cancelled = false;
+    const acquire = async () => {
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        if (cancelled) { lock.release(); return; }
+        wakeLockRef.current = lock;
+      } catch { /* not permitted — ignore */ }
+    };
+    acquire();
+    const onVisible = () => { if (document.visibilityState === "visible") acquire(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      wakeLockRef.current?.release().catch(() => {});
+      wakeLockRef.current = null;
+    };
+  }, [tracking]);
 
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(points)); } catch {}
@@ -85,6 +108,11 @@ function useHybridTracking() {
       setError("Geolocation not supported by this browser.");
       return;
     }
+    if (watchIdRef.current != null) return; // already watching
+    if (!window.isSecureContext) {
+      setError("Location needs HTTPS (or localhost). Open the app over a secure connection.");
+      return;
+    }
     setError(null);
     setTracking(true);
 
@@ -109,10 +137,18 @@ function useHybridTracking() {
             : next;
         });
       },
-      (err) => setError(err.message || "Geolocation error"),
+      (err) => {
+        const msg =
+          err.code === 1 ? "Location permission denied. Allow location access in your browser/site settings."
+          : err.code === 2 ? "Position unavailable. Check GPS / network and try again."
+          : err.code === 3 ? "Timed out getting location. Retrying…"
+          : err.message || "Geolocation error";
+        setError(msg);
+        if (err.code === 1) stop(); // permission denied is fatal
+      },
       { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 }
     );
-  }, []);
+  }, [stop]);
 
   const clear = useCallback(() => {
     stop();
@@ -126,15 +162,146 @@ function useHybridTracking() {
   return { tracking, start, stop, clear, points, latest, distanceKm, error };
 }
 
+// ---- PWA install hook ------------------------------------------------------
+function useInstallPrompt() {
+  const [deferred, setDeferred] = useState(null);
+  const [installed, setInstalled] = useState(
+    () => window.matchMedia?.("(display-mode: standalone)").matches || navigator.standalone === true
+  );
+
+  useEffect(() => {
+    const onPrompt = (e) => { e.preventDefault(); setDeferred(e); };
+    const onInstalled = () => { setInstalled(true); setDeferred(null); };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onPrompt);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  const install = useCallback(async () => {
+    if (deferred) {
+      deferred.prompt();
+      await deferred.userChoice;
+      setDeferred(null);
+      return null;
+    }
+    // Browsers without beforeinstallprompt (iOS Safari, Firefox, etc.)
+    const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    return ios
+      ? "On iPhone/iPad: tap the Share button, then “Add to Home Screen”."
+      : "Use your browser menu (⋮) and choose “Install app” / “Add to Home screen”.";
+  }, [deferred]);
+
+  return { installed, canPrompt: !!deferred, install };
+}
+
+function Navbar({ installed, onInstall, tracking }) {
+  return (
+    <nav className="gf-nav">
+      <div className="gf-nav-brand">
+        <img src="/icons/icon-192.png" alt="" width="28" height="28" />
+        <span>geoFind</span>
+      </div>
+      <div className="gf-nav-right">
+        <span className={`gf-live ${tracking ? "on" : ""}`}>{tracking ? "Live" : "Idle"}</span>
+      {!installed && (
+        <button className="gf-install" onClick={onInstall}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 3v12M7 10l5 5 5-5M5 21h14" />
+          </svg>
+          <span className="gf-install-label">Download app</span>
+        </button>
+      )}
+      </div>
+    </nav>
+  );
+}
+
 // ===========================================================================
 // 2) Map sub-components
 // ===========================================================================
-function FlyToLatest({ latest }) {
+function FlyToLatest({ latest, follow, recenterKey }) {
   const map = useMap();
   useEffect(() => {
-    if (latest) map.setView([latest.lat, latest.lng], map.getZoom(), { animate: true });
-  }, [latest, map]);
+    if (latest && follow) map.setView([latest.lat, latest.lng], map.getZoom(), { animate: true });
+  }, [latest, follow, map]);
+  useEffect(() => {
+    if (latest && recenterKey) map.flyTo([latest.lat, latest.lng], Math.max(map.getZoom(), 16));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recenterKey]);
   return null;
+}
+
+// ---- Map styles ------------------------------------------------------------
+const MAP_STYLES = {
+  street: {
+    label: "Street", swatch: "#a7d3a0",
+    url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    attribution: "&copy; OpenStreetMap contributors", maxZoom: 19,
+  },
+  satellite: {
+    label: "Satellite", swatch: "#2f4a3a",
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attribution: "Tiles &copy; Esri", maxZoom: 19,
+  },
+  terrain: {
+    label: "Terrain", swatch: "#c9b88a",
+    url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+    attribution: "&copy; OpenTopoMap, OpenStreetMap contributors", maxZoom: 17,
+  },
+  light: {
+    label: "Light", swatch: "#e5e7eb",
+    url: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+    attribution: "&copy; OpenStreetMap, &copy; CARTO", maxZoom: 20,
+  },
+  dark: {
+    label: "Dark", swatch: "#1f2937",
+    url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+    attribution: "&copy; OpenStreetMap, &copy; CARTO", maxZoom: 20,
+  },
+};
+const STYLE_KEY = "geofind_map_style_v1";
+
+function MapControls({ styleId, setStyleId, follow, setFollow, onRecenter, canRecenter }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="gf-mapctl">
+      <div className="gf-ctl-stack">
+        <button className={`gf-ctl ${open ? "active" : ""}`} onClick={() => setOpen((v) => !v)}
+                aria-label="Map style" aria-expanded={open} title="Map style">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 3 2 8l10 5 10-5-10-5z" /><path d="m2 13 10 5 10-5" /><path d="m2 17.5 10 5 10-5" />
+          </svg>
+        </button>
+        <button className="gf-ctl" onClick={onRecenter} disabled={!canRecenter} aria-label="Center on my location" title="Center on me">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3" /><circle cx="12" cy="12" r="8" /><path d="M12 1v3M12 20v3M1 12h3M20 12h3" />
+          </svg>
+        </button>
+        <button className={`gf-ctl ${follow ? "active" : ""}`} onClick={() => setFollow((v) => !v)}
+                aria-pressed={follow} aria-label="Follow my location" title={follow ? "Following: on" : "Following: off"}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="m3 11 19-9-9 19-2-8-8-2z" />
+          </svg>
+        </button>
+      </div>
+      {open && (
+        <div className="gf-styles" role="menu">
+          {Object.entries(MAP_STYLES).map(([id, st]) => (
+            <button key={id} role="menuitemradio" aria-checked={styleId === id}
+                    className={`gf-style ${styleId === id ? "sel" : ""}`}
+                    onClick={() => { setStyleId(id); setOpen(false); }}>
+              <i style={{ background: st.swatch }} />
+              {st.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function HeatLayer({ points, show }) {
@@ -181,17 +348,21 @@ function HeatLayer({ points, show }) {
   return null;
 }
 
-function MapView({ points, latest, geofence, insideGeofence, playbackPoint, showHeatmap }) {
+function MapView({ points, latest, geofence, insideGeofence, playbackPoint, showHeatmap, styleId, follow, recenterKey }) {
   const trail = points.map((p) => [p.lat, p.lng]);
   const center = latest ? [latest.lat, latest.lng] : DEFAULT_CENTER;
+  const st = MAP_STYLES[styleId] ?? MAP_STYLES.street;
 
   return (
-    <MapContainer center={center} zoom={16} style={{ height: "100%", width: "100%" }}>
+    <MapContainer center={center} zoom={16} maxZoom={20} style={{ height: "100%", width: "100%" }}>
       <TileLayer
-        attribution="&copy; OpenStreetMap contributors"
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        key={styleId}
+        attribution={st.attribution}
+        url={st.url}
+        maxZoom={st.maxZoom}
+        maxNativeZoom={st.maxZoom}
       />
-      <FlyToLatest latest={latest} />
+      <FlyToLatest latest={latest} follow={follow} recenterKey={recenterKey} />
 
       {trail.length > 1 && (
         <Polyline positions={trail} pathOptions={{ color: "#2563eb", weight: 4 }} />
@@ -273,17 +444,18 @@ function StatsPanel({ latest, distanceKm, points, error, geofenceStatus }) {
       {error && <div className="gf-error">⚠ {error}</div>}
       {latest ? (
         <>
-          <div className="gf-row"><span>📍 Latitude</span><b>{latest.lat.toFixed(6)}</b></div>
-          <div className="gf-row"><span>📍 Longitude</span><b>{latest.lng.toFixed(6)}</b></div>
-          <div className="gf-row"><span>🎯 Accuracy</span><b>±{Math.round(latest.accuracy)} m ({latest.sourceHint})</b></div>
-          <div className="gf-row"><span>🚀 Speed</span><b>{latest.speed != null ? (latest.speed * 3.6).toFixed(1) : "—"} km/h</b></div>
-          <div className="gf-row"><span>📏 Distance</span><b>{distanceKm.toFixed(3)} km</b></div>
-          <div className="gf-row"><span>⏱ Last update</span><b>{new Date(latest.timestamp).toLocaleTimeString()}</b></div>
-          <div className="gf-row"><span>📌 Points</span><b>{points.length}</b></div>
-          
+          <div className="gf-tiles">
+            <div className="gf-tile"><span>Latitude</span><b>{latest.lat.toFixed(5)}</b></div>
+            <div className="gf-tile"><span>Longitude</span><b>{latest.lng.toFixed(5)}</b></div>
+            <div className="gf-tile"><span>Accuracy</span><b>±{Math.round(latest.accuracy)} m</b><small>{latest.sourceHint}</small></div>
+            <div className="gf-tile"><span>Speed</span><b>{latest.speed != null ? (latest.speed * 3.6).toFixed(1) : "—"}</b><small>km/h</small></div>
+            <div className="gf-tile"><span>Distance</span><b>{distanceKm.toFixed(2)}</b><small>km</small></div>
+            <div className="gf-tile"><span>Points</span><b>{points.length}</b><small>{new Date(latest.timestamp).toLocaleTimeString()}</small></div>
+          </div>
+
           {geofenceStatus && (
             <div className={`gf-row gf-geofence ${geofenceStatus === "inside" ? "in" : "out"}`}>
-              <span>🚧 Geofence</span>
+              <span>Geofence</span>
               <b>{geofenceStatus === "inside" ? "INSIDE" : "OUTSIDE"}</b>
             </div>
           )}
@@ -343,6 +515,27 @@ export default function GeoFind() {
   const [insideGeofence, setInsideGeofence] = useState(false);
   const [alert, setAlert] = useState(null);
   const [playbackIdx, setPlaybackIdx] = useState(0);
+  const { installed, install } = useInstallPrompt();
+  const [sheetOpen, setSheetOpen] = useState(true);
+  const [styleId, setStyleId] = useState(() => {
+    try {
+      const v = localStorage.getItem(STYLE_KEY);
+      return v && MAP_STYLES[v] ? v : "street";
+    } catch { return "street"; }
+  });
+  const [follow, setFollow] = useState(true);
+  const [recenterKey, setRecenterKey] = useState(0);
+  useEffect(() => {
+    try { localStorage.setItem(STYLE_KEY, styleId); } catch {}
+  }, [styleId]);
+
+  const handleInstall = async () => {
+    const hint = await install();
+    if (hint) {
+      setAlert(hint);
+      setTimeout(() => setAlert(null), 6000);
+    }
+  };
 
   useEffect(() => {
     setPlaybackIdx(Math.max(0, points.length - 1));
@@ -381,6 +574,7 @@ export default function GeoFind() {
   return (
     <>
       <style>{STYLES}</style>
+      <Navbar installed={installed} onInstall={handleInstall} tracking={tracking} />
       <div className="gf-shell">
         <div className="gf-map-wrap">
                    <MapView
@@ -390,14 +584,29 @@ export default function GeoFind() {
             insideGeofence={insideGeofence}
             playbackPoint={playbackPoint}
             showHeatmap={showHeatmap}
+            styleId={styleId}
+            follow={follow}
+            recenterKey={recenterKey}
+          />
+          <MapControls
+            styleId={styleId}
+            setStyleId={setStyleId}
+            follow={follow}
+            setFollow={setFollow}
+            onRecenter={() => setRecenterKey((k) => k + 1)}
+            canRecenter={!!latest}
           />
           {alert && (
-            <div className={`gf-toast ${insideGeofence ? "ok" : "bad"}`}>{alert}</div>
+            <div className={`gf-toast ${/^(Entered|Left)/.test(alert) ? (insideGeofence ? "ok" : "bad") : "info"}`}>{alert}</div>
           )}
         </div>
 
-        <aside className="gf-side">
-          <h1>geoFind <span>· hybrid positioning</span></h1>
+        <aside className={`gf-side ${sheetOpen ? "open" : "closed"}`}>
+          <button className="gf-handle" onClick={() => setSheetOpen((v) => !v)}
+                  aria-label={sheetOpen ? "Collapse panel" : "Expand panel"} aria-expanded={sheetOpen}>
+            <i />
+          </button>
+          <h1>Hybrid positioning <span>GPS + Wi‑Fi + cell</span></h1>
           <ControlBar
             tracking={tracking}
             onStart={start}
@@ -455,138 +664,146 @@ export default function GeoFind() {
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-  .gf-shell { 
-    display: grid; 
-    grid-template-columns: 1fr 380px; 
-    height: 100vh; 
-    font-family: 'Inter', system-ui, sans-serif;
-    background: #f3f4f6;
+  :root {
+    --nav-h: 56px; --primary:#2563eb; --primary-d:#1d4ed8; --ink:#0f172a; --muted:#64748b;
+    --line:#e2e8f0; --card:#f8fafc; --radius:14px;
   }
-  @media (max-width:800px){ .gf-shell{ grid-template-columns: 1fr; grid-template-rows: 55vh 1fr; } }
-  
-  .gf-map-wrap { position:relative; height:100%; }
-  
-  .gf-side { 
-    background: #ffffff; 
-    padding: 24px; 
-    overflow-y: auto; 
-    box-shadow: -4px 0 24px rgba(0,0,0,0.05); 
-    z-index: 1000;
-  }
-  
-  .gf-side h1 { 
-    font-size: 24px; 
-    font-weight: 700;
-    margin: 0 0 20px 0; 
-    color: #111827;
-    letter-spacing: -0.5px;
-  }
-  .gf-side h1 span { color: #6b7280; font-size: 13px; font-weight: 500; letter-spacing: 0; }
+  .gf-shell, .gf-nav, .gf-side { font-family: 'Inter', system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
 
-  .gf-controlbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:20px; }
-  
-  .gf-controlbar button { 
-    padding: 10px 16px; 
-    border-radius: 8px; 
-    border: none; 
-    background: #f3f4f6; 
-    color: #374151;
-    font-weight: 600;
-    font-size: 13px;
-    cursor: pointer; 
-    transition: all 0.2s ease;
+  /* ---------- Navbar ---------- */
+  .gf-nav {
+    box-sizing: border-box; padding: 0 20px;
+    padding-top: env(safe-area-inset-top);
+    height: calc(var(--nav-h) + env(safe-area-inset-top));
+    display:flex; align-items:center; justify-content:space-between;
+    background: rgba(255,255,255,.92); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line); position: relative; z-index: 2000;
   }
-  .gf-controlbar button:hover { background: #e5e7eb; }
-  
-  .gf-controlbar button.primary { 
-    background: #3b82f6; 
-    color: #fff; 
-    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+  .gf-nav-brand { display:flex; align-items:center; gap:10px; font-weight:700; font-size:18px; color:var(--ink); letter-spacing:-.3px; }
+  .gf-nav-brand img { border-radius:8px; }
+  .gf-nav-right { display:flex; align-items:center; gap:12px; }
+  .gf-live { font-size:12px; font-weight:600; color:var(--muted); background:#f1f5f9; padding:5px 10px 5px 22px; border-radius:999px; position:relative; }
+  .gf-live::before { content:""; position:absolute; left:9px; top:50%; width:8px; height:8px; margin-top:-4px; border-radius:50%; background:#94a3b8; }
+  .gf-live.on { color:#166534; background:#dcfce7; }
+  .gf-live.on::before { background:#16a34a; animation: gfPulse 1.4s infinite; }
+  @keyframes gfPulse { 0%{box-shadow:0 0 0 0 rgba(22,163,74,.55)} 100%{box-shadow:0 0 0 8px rgba(22,163,74,0)} }
+  .gf-install {
+    display:inline-flex; align-items:center; gap:8px; min-height:40px; padding:0 16px; border:none; border-radius:10px;
+    background:var(--primary); color:#fff; font:600 13px 'Inter',system-ui,sans-serif; cursor:pointer;
+    box-shadow:0 4px 12px rgba(37,99,235,.3); transition: background .2s, transform .1s;
   }
-  .gf-controlbar button.primary:hover { background: #2563eb; }
-  
-  .gf-controlbar button.danger { 
-    background: #ef4444; 
-    color: #fff; 
-    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
-  }
-  .gf-controlbar button.danger:hover { background: #dc2626; }
-  
-  .gf-toggle { display:flex; align-items:center; gap:6px; font-size:13px; font-weight: 500; color: #4b5563; cursor: pointer; }
-  .gf-toggle input { accent-color: #3b82f6; width: 16px; height: 16px; cursor: pointer; }
+  .gf-install:hover { background:var(--primary-d); }
+  .gf-install:active { transform: scale(.97); }
 
-  .gf-badge { 
-    padding: 6px 12px; 
-    border-radius: 999px; 
-    font-size: 12px; 
-    font-weight: 700; 
-    letter-spacing: 0.5px;
+  /* ---------- Layout ---------- */
+  .gf-shell {
+    display:grid; grid-template-columns: 1fr 400px; background:#f1f5f9;
+    height: calc(100vh - var(--nav-h)); height: calc(100dvh - var(--nav-h) - env(safe-area-inset-top));
   }
-  .gf-badge.on { background: #dcfce7; color: #166534; }
-  .gf-badge.off { background: #f3f4f6; color: #4b5563; }
+  .gf-map-wrap { position:relative; height:100%; min-height:0; }
+  .gf-side {
+    background:#fff; padding:22px; overflow-y:auto; z-index:1000; position:relative;
+    box-shadow:-8px 0 30px rgba(15,23,42,.06);
+  }
+  .gf-side h1 { font-size:15px; font-weight:700; margin:0 0 16px; color:var(--ink); display:flex; align-items:baseline; gap:8px; }
+  .gf-side h1 span { color:var(--muted); font-size:12px; font-weight:500; }
+  .gf-handle { display:none; }
 
-  .gf-stats { 
-    background: #f9fafb;
-    border: 1px solid #e5e7eb; 
-    border-radius: 12px; 
-    padding: 16px; 
-    margin-bottom: 16px; 
+  /* ---------- Controls ---------- */
+  .gf-controlbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }
+  .gf-badge { padding:7px 12px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.3px; }
+  .gf-badge.on { background:#dcfce7; color:#166534; }
+  .gf-badge.off { background:#f1f5f9; color:#475569; }
+  .gf-controlbar button {
+    min-height:42px; padding:0 16px; border-radius:10px; border:none; background:#f1f5f9; color:#334155;
+    font:600 13px 'Inter',system-ui,sans-serif; cursor:pointer; transition: background .2s, transform .1s;
   }
-  .gf-row { 
-    display:flex; 
-    justify-content:space-between; 
-    padding: 8px 0; 
-    font-size: 13px; 
-    border-bottom: 1px solid #f3f4f6;
-  }
-  .gf-row:last-child { border-bottom: none; }
-  .gf-row span { color: #6b7280; font-weight: 500; }
-  .gf-row b { color: #111827; font-weight: 600; }
-  
-  .gf-geofence.in b { color: #16a34a; }
-  .gf-geofence.out b { color: #dc2626; }
+  .gf-controlbar button:hover { background:#e2e8f0; }
+  .gf-controlbar button:active { transform:scale(.97); }
+  .gf-controlbar button.primary { background:var(--primary); color:#fff; box-shadow:0 4px 12px rgba(37,99,235,.3); }
+  .gf-controlbar button.primary:hover { background:var(--primary-d); }
+  .gf-controlbar button.danger { background:#ef4444; color:#fff; box-shadow:0 4px 12px rgba(239,68,68,.3); }
+  .gf-controlbar button.danger:hover { background:#dc2626; }
+  .gf-toggle { display:flex; align-items:center; gap:8px; min-height:42px; padding:0 12px; border:1px solid var(--line); border-radius:10px;
+    font-size:13px; font-weight:500; color:#475569; cursor:pointer; user-select:none; }
+  .gf-toggle input { accent-color:var(--primary); width:18px; height:18px; cursor:pointer; margin:0; }
 
-  .gf-warn { background:#fef3c7; color:#92400e; padding:10px; border-radius:8px; font-size:12px; margin-top:12px; font-weight: 500; }
-  .gf-error { background:#fee2e2; color:#991b1b; padding:10px; border-radius:8px; font-size:12px; margin-bottom:12px; font-weight: 500; }
-  
-  .gf-spark { margin-top: 16px; }
-  
-  .gf-playback { display:flex; gap:10px; align-items:center; font-size:12px; font-weight: 500; color: #4b5563; margin-bottom: 16px; }
-  .gf-playback input[type=range] { flex:1; accent-color: #3b82f6; }
-  .gf-playback button { border: none; background: #e5e7eb; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-weight: 600; color: #374151; }
+  /* ---------- Stats ---------- */
+  .gf-stats { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:14px; margin-bottom:16px; }
+  .gf-tiles { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .gf-tile { background:#fff; border:1px solid var(--line); border-radius:12px; padding:10px 10px 9px; min-width:0; }
+  .gf-tile span { display:block; font-size:11px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+  .gf-tile b { display:block; font-size:16px; font-weight:700; color:var(--ink); margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-variant-numeric: tabular-nums; }
+  .gf-tile small { display:block; font-size:11px; color:var(--muted); margin-top:1px; }
+  .gf-row { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; margin-top:10px; font-size:13px; border-radius:10px; background:#fff; border:1px solid var(--line); }
+  .gf-row span { color:var(--muted); font-weight:500; }
+  .gf-row b { font-weight:700; }
+  .gf-geofence.in { background:#f0fdf4; border-color:#bbf7d0; } .gf-geofence.in b { color:#16a34a; }
+  .gf-geofence.out { background:#fef2f2; border-color:#fecaca; } .gf-geofence.out b { color:#dc2626; }
+  .gf-warn { background:#fef3c7; color:#92400e; padding:10px 12px; border-radius:10px; font-size:12px; margin-top:10px; font-weight:500; }
+  .gf-error { background:#fee2e2; color:#991b1b; padding:10px 12px; border-radius:10px; font-size:12px; margin-bottom:10px; font-weight:500; }
+  .gf-spark { margin-top:12px; background:#fff; border:1px solid var(--line); border-radius:12px; padding:10px 10px 6px; }
 
-  .gf-toast { 
-    position:absolute; 
-    top:24px; 
-    left:50%; 
-    transform:translateX(-50%);
-    padding: 12px 24px; 
-    border-radius: 8px; 
-    color:#fff; 
-    font-weight: 600;
-    font-size: 14px;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.2);
-    z-index:1000; 
-    animation: gfFade 3.5s ease-in-out; 
-  }
-  .gf-toast.ok { background:#16a34a; }
-  .gf-toast.bad { background:#dc2626; }
-  @keyframes gfFade { 0%{opacity:0; top: 10px;} 10%{opacity:1; top: 24px;} 90%{opacity:1; top: 24px;} 100%{opacity:0; top: 10px;} }
+  .gf-playback { display:flex; gap:10px; align-items:center; font-size:12px; font-weight:500; color:#475569; margin-bottom:16px; }
+  .gf-playback input[type=range] { flex:1; accent-color:var(--primary); min-width:0; height:28px; }
+  .gf-playback button { border:none; background:#e2e8f0; min-height:32px; padding:0 12px; border-radius:8px; cursor:pointer; font-weight:600; color:#334155; }
 
-  .gf-privacy { 
-    font-size: 12px; 
-    color: #4b5563; 
-    background: #eff6ff; 
-    padding: 16px; 
-    border-radius: 12px; 
-    border: 1px solid #dbeafe;
-    line-height: 1.5;
+  /* ---------- Map controls ---------- */
+  .gf-mapctl { position:absolute; top:12px; right:12px; z-index:1000; display:flex; flex-direction:row-reverse; gap:8px; align-items:flex-start; }
+  .gf-ctl-stack { display:flex; flex-direction:column; gap:8px; }
+  .gf-ctl {
+    width:44px; height:44px; display:flex; align-items:center; justify-content:center; border:none; border-radius:12px;
+    background:#fff; color:#334155; cursor:pointer; box-shadow:0 2px 10px rgba(15,23,42,.2); transition: background .2s, color .2s, transform .1s;
   }
-  .gf-privacy strong { color: #1e3a8a; display: block; margin-bottom: 6px; font-size: 13px; }
-  .gf-privacy ul { padding-left:16px; margin:0; }
-  .gf-privacy li { margin-bottom: 4px; }
-  
-  /* Make Leaflet map popups look modern */
-  .leaflet-popup-content-wrapper { border-radius: 12px !important; box-shadow: 0 4px 20px rgba(0,0,0,0.15) !important; }
-  .leaflet-popup-content { font-family: 'Inter', sans-serif !important; font-size: 13px !important; line-height: 1.5 !important; }
+  .gf-ctl:hover:not(:disabled) { background:#f1f5f9; }
+  .gf-ctl:active:not(:disabled) { transform:scale(.95); }
+  .gf-ctl:disabled { opacity:.45; cursor:not-allowed; }
+  .gf-ctl.active { background:var(--primary); color:#fff; }
+  .gf-styles { background:#fff; border-radius:14px; padding:6px; box-shadow:0 8px 30px rgba(15,23,42,.25); display:flex; flex-direction:column; gap:2px; min-width:150px; }
+  .gf-style { display:flex; align-items:center; gap:10px; min-height:42px; padding:0 10px; border:none; border-radius:10px; background:none;
+    font:600 13px 'Inter',system-ui,sans-serif; color:#334155; cursor:pointer; text-align:left; }
+  .gf-style:hover { background:#f1f5f9; }
+  .gf-style.sel { background:#eff6ff; color:var(--primary-d); }
+  .gf-style i { width:26px; height:26px; border-radius:8px; border:2px solid #fff; box-shadow:0 0 0 1px #cbd5e1; flex:none; }
+  .gf-style.sel i { box-shadow:0 0 0 2px var(--primary); }
+  .leaflet-top.leaflet-left { margin-top: 4px; }
+
+  .gf-toast {
+    position:absolute; top:20px; left:50%; transform:translateX(-50%); padding:12px 22px; border-radius:12px; color:#fff;
+    font-weight:600; font-size:14px; box-shadow:0 10px 25px rgba(0,0,0,.2); z-index:1000; animation: gfFade 3.5s ease-in-out;
+  }
+  .gf-toast.ok { background:#16a34a; } .gf-toast.bad { background:#dc2626; }
+  .gf-toast.info { background:#1e293b; width:max-content; max-width:88%; text-align:center; animation-duration:6s; }
+  @keyframes gfFade { 0%{opacity:0;top:8px} 8%{opacity:1;top:20px} 92%{opacity:1;top:20px} 100%{opacity:0;top:8px} }
+
+  .gf-privacy { font-size:12px; color:#475569; background:#eff6ff; padding:14px 16px; border-radius:var(--radius); border:1px solid #dbeafe; line-height:1.5; }
+  .gf-privacy strong { color:#1e3a8a; display:block; margin-bottom:6px; font-size:13px; }
+  .gf-privacy ul { padding-left:16px; margin:0; } .gf-privacy li { margin-bottom:3px; }
+
+  .leaflet-popup-content-wrapper { border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,.15) !important; }
+  .leaflet-popup-content { font-family:'Inter',sans-serif !important; font-size:13px !important; line-height:1.5 !important; }
+
+  /* ---------- Mobile: map fills screen, panel is a bottom sheet ---------- */
+  @media (max-width: 800px) {
+    .gf-nav { padding-left:14px; padding-right:14px; }
+    .gf-install-label { display:none; }
+    .gf-install { width:40px; padding:0; justify-content:center; }
+    .gf-shell { display:block; position:relative; }
+    .gf-map-wrap { position:absolute; inset:0; }
+    .gf-side {
+      position:absolute; left:0; right:0; bottom:0; height:auto; max-height:62%;
+      padding:0 16px calc(16px + env(safe-area-inset-bottom)); border-radius:22px 22px 0 0;
+      box-shadow:0 -10px 40px rgba(15,23,42,.18); transition: max-height .3s cubic-bezier(.32,.72,0,1);
+    }
+    .gf-side.closed { max-height:150px; overflow:hidden; }
+    .gf-handle { display:flex; justify-content:center; align-items:center; width:100%; height:28px; border:none; background:#fff; cursor:pointer; position:sticky; top:0; z-index:1; padding:0; }
+    .gf-handle i { width:40px; height:5px; border-radius:3px; background:#cbd5e1; }
+    .gf-side h1 { display:none; }
+    .gf-controlbar { gap:8px; }
+    .gf-controlbar button.primary, .gf-controlbar button.danger { flex:1; }
+    .gf-tile b { font-size:15px; }
+    .gf-toast { top:14px; font-size:13px; padding:10px 16px; }
+  }
+  @media (max-width: 380px) { .gf-tiles { grid-template-columns:repeat(2,1fr); } }
+  @media (prefers-reduced-motion: reduce) { .gf-side, .gf-live::before, .gf-toast { transition:none; animation:none; } }
 `;

@@ -1,4 +1,2 @@
-import GeoFind from "./geoFind.jsx";
-export default function App() {
-  return <GeoFind />;
-}
+html, body, #root { margin: 0; padding: 0; }
+body { overflow: hidden; }
