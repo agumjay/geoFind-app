@@ -273,34 +273,47 @@ function useHybridTracking() {
 
 // ---- PWA install hook ------------------------------------------------------
 function useInstallPrompt() {
-  const [deferred, setDeferred] = useState(null);
+  // main.jsx captures `beforeinstallprompt` early (it can fire before React mounts).
+  const [deferred, setDeferred] = useState(() => window.__gfInstallEvent ?? null);
   const [installed, setInstalled] = useState(
     () => window.matchMedia?.("(display-mode: standalone)").matches || navigator.standalone === true
   );
 
   useEffect(() => {
-    const onPrompt = (e) => { e.preventDefault(); setDeferred(e); };
-    const onInstalled = () => { setInstalled(true); setDeferred(null); };
-    window.addEventListener("beforeinstallprompt", onPrompt);
+    const onReady = () => setDeferred(window.__gfInstallEvent ?? null);
+    const onInstalled = () => { setInstalled(true); setDeferred(null); window.__gfInstallEvent = null; };
+    window.addEventListener("gf-install-ready", onReady);
     window.addEventListener("appinstalled", onInstalled);
     return () => {
-      window.removeEventListener("beforeinstallprompt", onPrompt);
+      window.removeEventListener("gf-install-ready", onReady);
       window.removeEventListener("appinstalled", onInstalled);
     };
   }, []);
 
   const install = useCallback(async () => {
     if (deferred) {
-      deferred.prompt();
-      await deferred.userChoice;
-      setDeferred(null);
-      return null;
+      try {
+        deferred.prompt();
+        const choice = await deferred.userChoice;
+        setDeferred(null);
+        window.__gfInstallEvent = null;
+        return choice.outcome === "accepted" ? "Installing geoFind…" : null;
+      } catch {
+        setDeferred(null);
+        window.__gfInstallEvent = null;
+      }
     }
-    // Browsers without beforeinstallprompt (iOS Safari, Firefox, etc.)
-    const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
-    return ios
-      ? "On iPhone/iPad: tap the Share button, then “Add to Home Screen”."
-      : "Use your browser menu (⋮) and choose “Install app” / “Add to Home screen”.";
+    // No install prompt available — explain why / how.
+    if (/iphone|ipad|ipod/i.test(navigator.userAgent)) {
+      return "On iPhone/iPad: tap the Share button, then “Add to Home Screen”.";
+    }
+    if (!window.isSecureContext) {
+      return "Installing needs HTTPS (or localhost). Open the deployed https:// site to install.";
+    }
+    if (import.meta.env.DEV) {
+      return "Install isn't available in dev mode. Run “npm run build && npm run preview”, open http://localhost:4173, then press Download again.";
+    }
+    return "Use your browser menu (⋮ or the install icon in the address bar) and choose “Install app” / “Add to Home screen”.";
   }, [deferred]);
 
   return { installed, canPrompt: !!deferred, install };
