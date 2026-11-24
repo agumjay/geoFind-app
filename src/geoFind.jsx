@@ -34,7 +34,35 @@ L.Icon.Default.mergeOptions({ iconRetinaUrl, iconUrl, shadowUrl });
 const STORAGE_KEY = "geofind_points_v1";
 const MAX_POINTS = 5000;
 const DEFAULT_CENTER = [0.3476, 32.5825]; // Kampala
-const GEOFENCE_RADIUS_M = 150;
+const MODE_KEY = "geofind_mode_v1";
+const IP_ACCURACY_M = 5000; // IP geolocation is typically city-level
+const IP_POLL_MS = 60000;
+
+// Free, key-less IP geolocation services (HTTPS + CORS). Tried in order.
+async function fetchIpLocation() {
+  const providers = [
+    async () => {
+      const r = await fetch("https://ipwho.is/");
+      const d = await r.json();
+      if (!d.success) throw new Error("ipwho.is failed");
+      return { lat: d.latitude, lng: d.longitude, ip: d.ip, place: [d.city, d.country].filter(Boolean).join(", ") };
+    },
+    async () => {
+      const r = await fetch("https://ipapi.co/json/");
+      const d = await r.json();
+      if (d.error || d.latitude == null) throw new Error("ipapi.co failed");
+      return { lat: d.latitude, lng: d.longitude, ip: d.ip, place: [d.city, d.country_name].filter(Boolean).join(", ") };
+    },
+  ];
+  let lastErr;
+  for (const p of providers) {
+    try {
+      const loc = await p();
+      if (Number.isFinite(loc.lat) && Number.isFinite(loc.lng)) return loc;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr ?? new Error("IP lookup failed");
+}
 
 // ===========================================================================
 // 1) Custom hook — hybrid-positioning tracker
@@ -55,7 +83,12 @@ function useHybridTracking() {
   const [error, setError] = useState(null);
   const [distanceKm, setDistanceKm] = useState(0);
 
+  const [mode, setMode] = useState(() => {
+    try { return localStorage.getItem(MODE_KEY) === "ip" ? "ip" : "gps"; } catch { return "gps"; }
+  });
+
   const watchIdRef = useRef(null);
+  const ipTimerRef = useRef(null);
   const wakeLockRef = useRef(null);
 
   // Keep the screen awake while tracking (browsers pause GPS when the screen locks).
@@ -95,22 +128,74 @@ function useHybridTracking() {
     setDistanceKm(total);
   }, [points]);
 
+  const addPoint = useCallback((newPt) => {
+    setPoints((prev) => {
+      const last = prev[prev.length - 1];
+      // IP lookups often return the same spot: refresh the timestamp instead of piling up points.
+      if (newPt.sourceHint === "ip" && last && last.sourceHint === "ip" &&
+          last.lat === newPt.lat && last.lng === newPt.lng) {
+        return [...prev.slice(0, -1), { ...last, timestamp: newPt.timestamp }];
+      }
+      const next = [...prev, newPt];
+      return next.length > MAX_POINTS ? next.slice(next.length - MAX_POINTS) : next;
+    });
+  }, []);
+
   const stop = useCallback(() => {
     if (watchIdRef.current != null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
+    if (ipTimerRef.current != null) {
+      clearInterval(ipTimerRef.current);
+      ipTimerRef.current = null;
+    }
     setTracking(false);
   }, []);
 
+  // ---- IP-address tracking (city-level, works without GPS permission) ------
+  const startIp = useCallback((notice) => {
+    if (ipTimerRef.current != null) return;
+    setError(notice ?? null);
+    setTracking(true);
+    const poll = async () => {
+      try {
+        const loc = await fetchIpLocation();
+        addPoint({
+          id: crypto.randomUUID?.() ?? String(Date.now()),
+          lat: loc.lat,
+          lng: loc.lng,
+          accuracy: IP_ACCURACY_M,
+          speed: null,
+          timestamp: Date.now(),
+          sourceHint: "ip",
+          place: loc.place,
+          ip: loc.ip,
+        });
+        setError((e) => (e && e.startsWith("Couldn't look up") ? null : e));
+      } catch {
+        setError("Couldn't look up your location from your IP address. Check your connection or disable ad-blockers for this site.");
+      }
+    };
+    poll();
+    ipTimerRef.current = setInterval(poll, IP_POLL_MS);
+  }, [addPoint]);
+
+  const changeMode = useCallback((m) => {
+    stop();
+    setMode(m);
+    try { localStorage.setItem(MODE_KEY, m); } catch { /* ignore */ }
+  }, [stop]);
+
   const start = useCallback(() => {
+    if (watchIdRef.current != null || ipTimerRef.current != null) return; // already running
+    if (mode === "ip") { startIp(); return; }
     if (!("geolocation" in navigator)) {
-      setError("Geolocation not supported by this browser.");
+      startIp("GPS isn't supported here — using your IP address (approximate).");
       return;
     }
-    if (watchIdRef.current != null) return; // already watching
     if (!window.isSecureContext) {
-      setError("Location needs HTTPS (or localhost). Open the app over a secure connection.");
+      startIp("GPS needs HTTPS — using your IP address instead (approximate).");
       return;
     }
     setError(null);
@@ -130,25 +215,24 @@ function useHybridTracking() {
           sourceHint:
             accuracy <= 20 ? "gps" : accuracy <= 50 ? "hybrid" : "network",
         };
-        setPoints((prev) => {
-          const next = [...prev, newPt];
-          return next.length > MAX_POINTS
-            ? next.slice(next.length - MAX_POINTS)
-            : next;
-        });
+        addPoint(newPt);
       },
       (err) => {
-        const msg =
-          err.code === 1 ? "Location permission denied. Allow location access in your browser/site settings."
-          : err.code === 2 ? "Position unavailable. Check GPS / network and try again."
-          : err.code === 3 ? "Timed out getting location. Retrying…"
-          : err.message || "Geolocation error";
-        setError(msg);
-        if (err.code === 1) stop(); // permission denied is fatal
+        if (err.code === 1 || err.code === 2) {
+          // Permission denied / no GPS: fall back to IP-based location.
+          stop();
+          startIp(
+            err.code === 1
+              ? "Location permission denied — using your IP address instead (approximate)."
+              : "GPS unavailable — using your IP address instead (approximate)."
+          );
+          return;
+        }
+        setError(err.code === 3 ? "Timed out getting location. Retrying…" : err.message || "Geolocation error");
       },
       { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 }
     );
-  }, [stop]);
+  }, [stop, startIp, addPoint, mode]);
 
   const clear = useCallback(() => {
     stop();
@@ -159,7 +243,7 @@ function useHybridTracking() {
   useEffect(() => () => stop(), [stop]);
 
   const latest = points.length ? points[points.length - 1] : null;
-  return { tracking, start, stop, clear, points, latest, distanceKm, error };
+  return { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode };
 }
 
 // ---- PWA install hook ------------------------------------------------------
@@ -258,7 +342,11 @@ function Navbar({ installed, onInstall, tracking, theme, onToggleTheme }) {
 function FlyToLatest({ latest, follow, recenterKey }) {
   const map = useMap();
   useEffect(() => {
-    if (latest && follow) map.setView([latest.lat, latest.lng], map.getZoom(), { animate: true });
+    if (latest && follow) {
+      // IP fixes are city-level: don't sit zoomed in on a street.
+      const zoom = latest.sourceHint === "ip" ? Math.min(map.getZoom(), 12) : map.getZoom();
+      map.setView([latest.lat, latest.lng], zoom, { animate: true });
+    }
   }, [latest, follow, map]);
   useEffect(() => {
     if (latest && recenterKey) map.flyTo([latest.lat, latest.lng], Math.max(map.getZoom(), 16));
@@ -406,9 +494,18 @@ function MapView({ points, latest, geofence, insideGeofence, playbackPoint, show
             <strong>You are here</strong><br />
             Accuracy: ±{Math.round(latest.accuracy)} m<br />
             Source: {latest.sourceHint}<br />
+            {latest.place && <>Near: {latest.place}<br /></>}
             Time: {new Date(latest.timestamp).toLocaleTimeString()}
           </Popup>
         </Marker>
+      )}
+
+      {latest?.sourceHint === "ip" && (
+        <Circle
+          center={[latest.lat, latest.lng]}
+          radius={latest.accuracy}
+          pathOptions={{ color: "#8b5cf6", fillColor: "#8b5cf6", fillOpacity: 0.1, weight: 1, dashArray: "6 6" }}
+        />
       )}
 
       {playbackPoint && (
@@ -440,12 +537,23 @@ function MapView({ points, latest, geofence, insideGeofence, playbackPoint, show
 // 3) Panels
 // ===========================================================================
 function ControlBar({
+  mode, onModeChange,
   tracking, onStart, onStop, onClear,
   geofenceOn, onToggleGeofence,
   showHeatmap, onToggleHeatmap,
 }) {
   return (
     <div className="gf-controlbar">
+      <div className="gf-seg" role="radiogroup" aria-label="Tracking source">
+        <button type="button" role="radio" aria-checked={mode === "gps"}
+                className={mode === "gps" ? "sel" : ""} onClick={() => onModeChange("gps")}>
+          📡 GPS / Device
+        </button>
+        <button type="button" role="radio" aria-checked={mode === "ip"}
+                className={mode === "ip" ? "sel" : ""} onClick={() => onModeChange("ip")}>
+          🌐 IP address
+        </button>
+      </div>
       <div className={`gf-badge ${tracking ? "on" : "off"}`}>
         {tracking ? "● Tracking ON" : "○ Tracking OFF"}
       </div>
@@ -493,7 +601,11 @@ function StatsPanel({ latest, distanceKm, points, error, geofenceStatus }) {
           )}
           
           {latest.accuracy > 50 && (
-            <div className="gf-warn">⚠ Coarse accuracy — hybrid fallback (Wi‑Fi/cell) likely in use.</div>
+            <div className="gf-warn">
+              {latest.sourceHint === "ip"
+                ? `⚠ Approximate location from your IP address${latest.place ? ` (near ${latest.place})` : ""} — typically city-level, can be several km off.`
+                : "⚠ Coarse accuracy — hybrid fallback (Wi‑Fi/cell) likely in use."}
+            </div>
           )}
           
           <div className="gf-spark">
@@ -538,7 +650,7 @@ function PlaybackControls({ points, index, setIndex, onReset }) {
 // 4) Root component
 // ===========================================================================
 export default function GeoFind() {
-  const { tracking, start, stop, clear, points, latest, distanceKm, error } = useHybridTracking();
+  const { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode } = useHybridTracking();
 
   const [geofenceOn, setGeofenceOn] = useState(false);
   const [showHeatmap, setShowHeatmap] = useState(false);
@@ -641,6 +753,8 @@ export default function GeoFind() {
           </button>
           <h1>Hybrid positioning <span>GPS + Wi‑Fi + cell</span></h1>
           <ControlBar
+            mode={mode}
+            onModeChange={changeMode}
             tracking={tracking}
             onStart={start}
             onStop={stop}
@@ -681,6 +795,7 @@ export default function GeoFind() {
             <strong>Privacy</strong>
             <ul>
               <li>Data stored only in this browser.</li>
+              <li>IP mode sends a request to a public IP-lookup service (ipwho.is / ipapi.co), which sees your IP address.</li>
               <li>Press <b>Stop</b> any time; <b>Clear data</b> deletes all points.</li>
               <li>Geofence only watches your own device.</li>
             </ul>
@@ -744,6 +859,14 @@ const STYLES = `
 
   /* ---------- Controls ---------- */
   .gf-controlbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }
+  .gf-seg { display:flex; width:100%; padding:4px; gap:4px; background:#f1f5f9; border-radius:12px; }
+  .gf-controlbar .gf-seg button { flex:1; min-height:38px; padding:0 10px; border-radius:9px; background:transparent; color:#64748b; box-shadow:none; }
+  .gf-controlbar .gf-seg button:hover { background:#e2e8f0; }
+  .gf-controlbar .gf-seg button.sel { background:#fff; color:var(--primary-d); box-shadow:0 1px 4px rgba(15,23,42,.15); }
+  [data-theme="dark"] .gf-seg { background:#1e293b; }
+  [data-theme="dark"] .gf-controlbar .gf-seg button { background:transparent; color:#94a3b8; }
+  [data-theme="dark"] .gf-controlbar .gf-seg button:hover { background:#273449; }
+  [data-theme="dark"] .gf-controlbar .gf-seg button.sel { background:#0f172a; color:#93c5fd; }
   .gf-badge { padding:7px 12px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.3px; }
   .gf-badge.on { background:#dcfce7; color:#166534; }
   .gf-badge.off { background:#f1f5f9; color:#475569; }

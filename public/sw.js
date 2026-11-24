@@ -1,5 +1,5 @@
 // geoFind service worker: cache app shell, runtime-cache map tiles & assets.
-const CACHE = "geofind-v2";
+const CACHE = "geofind-v3";
 const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/favicon.svg"];
 
 self.addEventListener("install", (e) => {
@@ -19,6 +19,8 @@ self.addEventListener("fetch", (e) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (!/^https?:$/.test(url.protocol)) return;
+  // Never cache IP-geolocation lookups (must always be fresh).
+  if (url.hostname === "ipwho.is" || url.hostname === "ipapi.co") return;
 
   // Page navigations: network first, fall back to cached shell when offline.
   if (req.mode === "navigate") {

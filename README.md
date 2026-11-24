@@ -61,6 +61,7 @@ Then open the site on your phone, allow location, and tap **Download app** (iOS 
 
 - Uses `navigator.geolocation.watchPosition` with high accuracy; modern phones fuse GPS + Wi-Fi + cell.
 - The screen is kept awake while tracking (Wake Lock), because browsers pause GPS when the screen locks. Web apps cannot track in the background.
+- **IP address mode**: switch the source to *IP address* in the panel to locate the device from its public IP via ipwho.is (fallback ipapi.co). It needs no GPS or permission, so it also works over plain HTTP, but it is only city-level accurate (a dashed purple circle shows the uncertainty) and refreshes every 60 s. It also kicks in automatically if GPS is denied, unavailable, or the page isn't served over HTTPS. Note this sends a request to those third-party services, which see your IP.
 - Points are stored only in your browser (`localStorage`). **Clear data** deletes them.
 
 ## Troubleshooting
