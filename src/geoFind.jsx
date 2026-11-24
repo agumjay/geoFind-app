@@ -7,6 +7,7 @@ import {
   Marker,
   Polyline,
   Circle,
+  CircleMarker,
   Popup,
   useMap,
 } from "react-leaflet";
@@ -22,6 +23,13 @@ import * as L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import "leaflet.heat";
 import * as turf from "@turf/turf";
+import { db } from "./storage";
+import { cellKey, reverseGeocode } from "./places";
+import { useRoutes } from "./useRoutes";
+import { routeStatus, fmtDist } from "./schedule";
+import HistoryPage from "./HistoryPage";
+import RoutesPage from "./RoutesPage";
+import "./pages.css";
 
 // ---- Leaflet default-icon fix for bundlers (Vite) --------------------------
 import iconUrl from "leaflet/dist/images/marker-icon.png";
@@ -32,43 +40,6 @@ L.Icon.Default.mergeOptions({ iconRetinaUrl, iconUrl, shadowUrl });
 
 // ---- Constants -------------------------------------------------------------
 const STORAGE_KEY = "geofind_points_v1";
-const DB_NAME = "geofind";
-const DB_STORE = "points";
-
-// ---- Persistent store (IndexedDB): keeps EVERY location ever collected ------
-// localStorage caps out around 5 MB; IndexedDB scales to hundreds of thousands of points.
-let dbPromise = null;
-function openDb() {
-  if (!dbPromise) {
-    dbPromise = new Promise((resolve, reject) => {
-      if (!("indexedDB" in window)) { reject(new Error("IndexedDB unavailable")); return; }
-      const req = indexedDB.open(DB_NAME, 1);
-      req.onupgradeneeded = () => {
-        const st = req.result.createObjectStore(DB_STORE, { keyPath: "id" });
-        st.createIndex("timestamp", "timestamp");
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-    dbPromise.catch(() => { dbPromise = null; });
-  }
-  return dbPromise;
-}
-async function dbTx(mode, fn) {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(DB_STORE, mode);
-    const out = fn(tx.objectStore(DB_STORE));
-    tx.oncomplete = () => resolve(out?.result);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
-  });
-}
-const dbAll = () => dbTx("readonly", (st) => st.getAll());
-const dbPut = (pt) => dbTx("readwrite", (st) => st.put(pt)).catch(() => {});
-const dbPutMany = (pts) => dbTx("readwrite", (st) => { pts.forEach((p) => st.put(p)); }).catch(() => {});
-const dbClear = () => dbTx("readwrite", (st) => st.clear()).catch(() => {});
-
 // Consecutive points of the same kind (IP guess vs device fix) form one segment, so the
 // trail/distance never draws a bogus long line between an IP guess and a real fix.
 function toSegments(points) {
@@ -82,92 +53,6 @@ function toSegments(points) {
   return segs;
 }
 
-const CELL_DEG = 0.003;      // ~330 m grid used to group "areas"
-const MAX_GAP_S = 300;       // gaps longer than this aren't counted as time spent
-const MAX_SANE_MPS = 120;    // ignore GPS spikes faster than ~430 km/h
-
-function computeInsights(points) {
-  const pts = points.filter((p) => p.sourceHint !== "ip"); // IP guesses are not real movement
-  if (!pts.length) return null;
-  let maxSpeed = null, movingDist = 0, movingTime = 0, activeTime = 0;
-  const cells = new Map();
-  const first = pts[0];
-  let farthest = { km: 0, point: first };
-  let prevCell = null;
-
-  pts.forEach((p, i) => {
-    const key = `${Math.round(p.lat / CELL_DEG)}:${Math.round(p.lng / CELL_DEG)}`;
-    let c = cells.get(key);
-    if (!c) { c = { key, n: 0, visits: 0, dwell: 0, lat: 0, lng: 0, last: 0 }; cells.set(key, c); }
-    c.n++; c.lat += p.lat; c.lng += p.lng; c.last = p.timestamp;
-    if (key !== prevCell) c.visits++;
-    prevCell = key;
-
-    const d0 = turf.distance(turf.point([first.lng, first.lat]), turf.point([p.lng, p.lat]), { units: "kilometers" });
-    if (d0 > farthest.km) farthest = { km: d0, point: p };
-
-    if (i === 0) return;
-    const q = pts[i - 1];
-    const dt = (p.timestamp - q.timestamp) / 1000;
-    if (dt <= 0 || dt > MAX_GAP_S) return;
-    activeTime += dt;
-    const prevKey = `${Math.round(q.lat / CELL_DEG)}:${Math.round(q.lng / CELL_DEG)}`;
-    cells.get(prevKey).dwell += dt;
-
-    const dKm = turf.distance(turf.point([q.lng, q.lat]), turf.point([p.lng, p.lat]), { units: "kilometers" });
-    let v = Number.isFinite(p.speed) ? p.speed : null;           // m/s reported by the device
-    if (v == null && dt >= 1 && (p.accuracy ?? 99) <= 50 && (q.accuracy ?? 99) <= 50) v = (dKm * 1000) / dt;
-    if (v != null && v <= MAX_SANE_MPS) {
-      if (!maxSpeed || v > maxSpeed.mps) maxSpeed = { mps: v, point: p };
-      if (v > 0.5) { movingTime += dt; movingDist += dKm; }
-    }
-  });
-
-  const areas = [...cells.values()]
-    .map((c) => ({ ...c, lat: c.lat / c.n, lng: c.lng / c.n }))
-    .sort((a, b) => b.visits - a.visits || b.dwell - a.dwell)
-    .slice(0, 5);
-  const days = new Set(pts.map((p) => new Date(p.timestamp).toDateString())).size;
-
-  return {
-    maxSpeed,
-    avgMovingKmh: movingTime > 0 ? movingDist / (movingTime / 3600) : null,
-    activeTime, days, areas, farthest,
-    totalPoints: pts.length,
-  };
-}
-function fmtDuration(sec) {
-  if (!sec || sec < 60) return `${Math.round(sec || 0)} s`;
-  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
-  return h ? `${h} h ${m} m` : `${m} min`;
-}
-
-function download(filename, text, type) {
-  const url = URL.createObjectURL(new Blob([text], { type }));
-  const a = document.createElement("a");
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-function exportCsv(points) {
-  const head = ["timestamp_iso", "lat", "lng", "accuracy_m", "speed_mps", "source", "place"];
-  const rows = points.map((p) => [
-    new Date(p.timestamp).toISOString(), p.lat, p.lng, Math.round(p.accuracy ?? 0), p.speed ?? "", p.sourceHint ?? "",
-    `"${(p.place ?? "").replace(/"/g, '""')}"`,
-  ].join(","));
-  download("geofind-locations.csv", [head.join(","), ...rows].join("\n"), "text/csv");
-}
-function exportGeoJson(points) {
-  const fc = {
-    type: "FeatureCollection",
-    features: points.map((p) => ({
-      type: "Feature",
-      geometry: { type: "Point", coordinates: [p.lng, p.lat] },
-      properties: { time: new Date(p.timestamp).toISOString(), accuracy: p.accuracy, speed: p.speed, source: p.sourceHint, place: p.place },
-    })),
-  };
-  download("geofind-locations.geojson", JSON.stringify(fc), "application/geo+json");
-}
 const DEFAULT_CENTER = [0.3476, 32.5825]; // Kampala
 const MODE_KEY = "geofind_mode_v1";
 const GPS_ONLY_KEY = "geofind_gpsonly_v1";
@@ -253,31 +138,92 @@ function useHybridTracking() {
     };
   }, [tracking]);
 
+  // ---- Place names: every new ~100 m area is reverse-geocoded once, cached, and
+  //      written onto all points in that area (so stored locations carry names). ----
+  const placesRef = useRef(new Map());      // cell key -> place
+  const queuedRef = useRef(new Set());
+  const retryAtRef = useRef(new Map());     // cell key -> time we may retry after a failure
+
+  const applyPlace = useCallback((place) => {
+    const changed = [];
+    const next = pointsRef.current.map((p) => {
+      if (p.placeKey === place.key && !p.place) {
+        const u = { ...p, place: place.label, address: place.address };
+        changed.push(u);
+        return u;
+      }
+      return p;
+    });
+    if (changed.length) {
+      pointsRef.current = next;
+      setPoints(next);
+      db.putMany("points", changed);
+    }
+  }, []);
+
+  const requestName = useCallback((key, lat, lng) => {
+    if (placesRef.current.has(key) || queuedRef.current.has(key)) return;
+    if ((retryAtRef.current.get(key) ?? 0) > Date.now()) return;
+    if (queuedRef.current.size >= 300) return; // the rest is picked up on the next load
+    queuedRef.current.add(key);
+    reverseGeocode(lat, lng)
+      .then((found) => {
+        const place = found ?? { key, label: "Unnamed place", address: "" };
+        placesRef.current.set(key, place);
+        db.put("places", place);
+        applyPlace(place);
+      })
+      .catch(() => retryAtRef.current.set(key, Date.now() + 2 * 60 * 1000))
+      .finally(() => queuedRef.current.delete(key));
+  }, [applyPlace]);
+
   // Load the full history from IndexedDB (and migrate the old localStorage copy once).
   useEffect(() => {
     let alive = true;
     (async () => {
       let stored = [];
       try {
-        stored = await dbAll();
+        stored = await db.all("points");
         const legacy = localStorage.getItem(STORAGE_KEY);
         if (legacy) {
           const old = JSON.parse(legacy);
-          if (Array.isArray(old) && old.length) { await dbPutMany(old); stored = await dbAll(); }
+          if (Array.isArray(old) && old.length) { await db.putMany("points", old); stored = await db.all("points"); }
           localStorage.removeItem(STORAGE_KEY);
         }
+        (await db.all("places")).forEach((pl) => placesRef.current.set(pl.key, pl));
         navigator.storage?.persist?.(); // ask the browser not to evict our data
       } catch { /* storage unavailable: keep working in memory */ }
       if (!alive) return;
       const ids = new Set(stored.map((p) => p.id));
-      const merged = [...stored, ...pointsRef.current.filter((p) => !ids.has(p.id))]
+      let merged = [...stored, ...pointsRef.current.filter((p) => !ids.has(p.id))]
         .sort((x, y) => x.timestamp - y.timestamp);
+
+      // Give older points a place key + any name we already know.
+      const upgraded = [];
+      merged = merged.map((p) => {
+        if (p.sourceHint === "ip" || p.place) return p;
+        const key = p.placeKey ?? cellKey(p.lat, p.lng);
+        const known = placesRef.current.get(key);
+        const u = { ...p, placeKey: key, ...(known ? { place: known.label, address: known.address } : {}) };
+        upgraded.push(u);
+        return u;
+      });
+      if (upgraded.length) db.putMany("points", upgraded);
       pointsRef.current = merged;
       setPoints(merged);
       setLoaded(true);
+
+      // Look up names for places we've never resolved, newest first.
+      const seen = new Set();
+      for (let i = merged.length - 1; i >= 0; i--) {
+        const p = merged[i];
+        if (p.sourceHint === "ip" || p.place || seen.has(p.placeKey)) continue;
+        seen.add(p.placeKey);
+        requestName(p.placeKey, p.lat, p.lng);
+      }
     })();
     return () => { alive = false; };
-  }, []);
+  }, [requestName]);
 
   useEffect(() => {
     let total = 0;
@@ -301,14 +247,23 @@ function useHybridTracking() {
         last.lat === newPt.lat && last.lng === newPt.lng) {
       const updated = { ...last, timestamp: newPt.timestamp };
       next = [...prev.slice(0, -1), updated];
-      dbPut(updated);
+      db.put("points", updated);
     } else {
-      next = [...prev, newPt];
-      dbPut(newPt);
+      let pt = newPt;
+      if (pt.sourceHint !== "ip") {
+        const key = cellKey(pt.lat, pt.lng);
+        const known = placesRef.current.get(key);
+        pt = { ...pt, placeKey: key, ...(known ? { place: known.label, address: known.address } : {}) };
+        if (!known) requestName(key, pt.lat, pt.lng);
+      } else {
+        pt = { ...pt, address: pt.place };
+      }
+      next = [...prev, pt];
+      db.put("points", pt);
     }
     pointsRef.current = next;
     setPoints(next);
-  }, []);
+  }, [requestName]);
 
   const stop = useCallback(() => {
     if (watchIdRef.current != null) {
@@ -413,7 +368,7 @@ function useHybridTracking() {
     stop();
     pointsRef.current = [];
     setPoints([]);
-    dbClear();
+    db.clear("points");
   }, [stop]);
 
   useEffect(() => () => stop(), [stop]);
@@ -525,6 +480,26 @@ function Navbar({ installed, onInstall, tracking, theme, onToggleTheme }) {
   );
 }
 
+const TAB_ICONS = {
+  map: <path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14" />,
+  history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5M12 7v5l3 2" /></>,
+  routes: <><circle cx="6" cy="19" r="2.5" /><circle cx="18" cy="5" r="2.5" /><path d="M8.5 19H15a3.5 3.5 0 0 0 0-7H9a3.5 3.5 0 0 1 0-7h6.5" /></>,
+};
+function Tabs({ tab, onTab, upcoming }) {
+  const items = [["map", "Map"], ["history", "History"], ["routes", "Routes"]];
+  return (
+    <div className="gf-tabs" role="tablist">
+      {items.map(([id, label]) => (
+        <button key={id} role="tab" aria-selected={tab === id} className={`gf-tab ${tab === id ? "sel" : ""}`} onClick={() => onTab(id)}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{TAB_ICONS[id]}</svg>
+          {label}
+          {id === "routes" && upcoming > 0 && <span className="gf-badge-n">{upcoming}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ===========================================================================
 // 2) Map sub-components
 // ===========================================================================
@@ -616,6 +591,23 @@ function MapControls({ styleId, setStyleId, follow, setFollow, onRecenter, canRe
   );
 }
 
+function MapResize({ visible }) {
+  const map = useMap();
+  useEffect(() => {
+    if (visible) { const t = setTimeout(() => map.invalidateSize(), 60); return () => clearTimeout(t); }
+  }, [visible, map]);
+  return null;
+}
+
+function FitRoute({ route, fitKey }) {
+  const map = useMap();
+  useEffect(() => {
+    if (route && fitKey) map.fitBounds(route.coords, { padding: [60, 60] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitKey]);
+  return null;
+}
+
 function HeatLayer({ points, show }) {
   const map = useMap();
   const layerRef = useRef(null);
@@ -660,7 +652,7 @@ function HeatLayer({ points, show }) {
   return null;
 }
 
-function MapView({ points, latest, geofence, insideGeofence, playbackPoint, showHeatmap, styleId, follow, recenterKey, focus }) {
+function MapView({ points, latest, geofence, insideGeofence, playbackPoint, showHeatmap, styleId, follow, recenterKey, focus, route, fitKey, visible }) {
   const segments = toSegments(points).filter((sg) => sg.pts.length > 1);
   const center = latest ? [latest.lat, latest.lng] : DEFAULT_CENTER;
   const st = MAP_STYLES[styleId] ?? MAP_STYLES.street;
@@ -674,6 +666,19 @@ function MapView({ points, latest, geofence, insideGeofence, playbackPoint, show
         maxZoom={20}
         maxNativeZoom={st.maxZoom}
       />
+      <MapResize visible={visible} />
+      <FitRoute route={route} fitKey={fitKey} />
+      {route && (
+        <>
+          <Polyline positions={route.coords} pathOptions={{ color: "#f97316", weight: 6, opacity: 0.85 }} />
+          <CircleMarker center={[route.from.lat, route.from.lng]} radius={8} pathOptions={{ color: "#fff", weight: 3, fillColor: "#16a34a", fillOpacity: 1 }}>
+            <Popup><strong>Start</strong><br />{route.from.label}</Popup>
+          </CircleMarker>
+          <Marker position={[route.to.lat, route.to.lng]}>
+            <Popup><strong>Destination</strong><br />{route.to.label}<br />{fmtDist(route.distanceM)}</Popup>
+          </Marker>
+        </>
+      )}
       <FlyToLatest latest={latest} follow={follow} recenterKey={recenterKey} target={focus} />
 
       {segments.map((sg, i) => (
@@ -834,70 +839,6 @@ function StatsPanel({ latest, distanceKm, points, error, geofenceStatus }) {
   );
 }
 
-function InsightsPanel({ points, distanceKm, onFocus }) {
-  const ins = useMemo(() => computeInsights(points), [points]);
-  if (!ins) return null;
-  const top = ins.maxSpeed;
-  return (
-    <div className="gf-insights">
-      <strong>Insights <small>from all saved locations</small></strong>
-      <div className="gf-tiles">
-        <button className="gf-tile gf-tile-btn" disabled={!top} onClick={() => top && onFocus(top.point.lat, top.point.lng)}
-                title="Show where this was recorded">
-          <span>Top speed</span>
-          <b>{top ? (top.mps * 3.6).toFixed(1) : "—"}</b>
-          <small>km/h{top ? ` · ${new Date(top.point.timestamp).toLocaleDateString()}` : ""}</small>
-        </button>
-        <div className="gf-tile"><span>Avg moving</span><b>{ins.avgMovingKmh != null ? ins.avgMovingKmh.toFixed(1) : "—"}</b><small>km/h</small></div>
-        <div className="gf-tile"><span>Total distance</span><b>{distanceKm.toFixed(2)}</b><small>km</small></div>
-        <div className="gf-tile"><span>Time tracked</span><b>{fmtDuration(ins.activeTime)}</b><small>{ins.days} day{ins.days === 1 ? "" : "s"}</small></div>
-        <button className="gf-tile gf-tile-btn" onClick={() => onFocus(ins.farthest.point.lat, ins.farthest.point.lng)} title="Show on map">
-          <span>Farthest from start</span><b>{ins.farthest.km.toFixed(2)}</b><small>km</small>
-        </button>
-        <div className="gf-tile"><span>GPS points</span><b>{ins.totalPoints.toLocaleString()}</b><small>recorded</small></div>
-      </div>
-      <div className="gf-areas">
-        <span className="gf-areas-title">Most visited areas</span>
-        {ins.areas.map((a, i) => (
-          <button key={a.key} className="gf-area" onClick={() => onFocus(a.lat, a.lng)}>
-            <i>{i + 1}</i>
-            <span className="gf-area-main">
-              <b>{a.lat.toFixed(4)}, {a.lng.toFixed(4)}</b>
-              <small>{a.visits} visit{a.visits === 1 ? "" : "s"} · {fmtDuration(a.dwell)} spent · last {new Date(a.last).toLocaleDateString()}</small>
-            </span>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function DataPanel({ points, loaded, onClear }) {
-  const first = points[0], last = points[points.length - 1];
-  const fmt = (t) => new Date(t).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
-  return (
-    <div className="gf-data">
-      <div className="gf-data-head">
-        <strong>Saved locations</strong>
-        <span className="gf-data-count">{loaded ? points.length.toLocaleString() : "…"}</span>
-      </div>
-      <small>
-        {points.length
-          ? `Every point is stored on this device · ${fmt(first.timestamp)} → ${fmt(last.timestamp)}`
-          : "Every location collected is saved on this device automatically."}
-      </small>
-      <div className="gf-data-actions">
-        <button disabled={!points.length} onClick={() => exportCsv(points)}>Export CSV</button>
-        <button disabled={!points.length} onClick={() => exportGeoJson(points)}>Export GeoJSON</button>
-        <button className="warn" disabled={!points.length}
-                onClick={() => { if (window.confirm(`Permanently delete all ${points.length} saved locations?`)) onClear(); }}>
-          Delete all
-        </button>
-      </div>
-    </div>
-  );
-}
-
 function PlaybackControls({ points, index, setIndex, onReset }) {
   if (points.length < 2) return null;
   const p = points[index];
@@ -939,11 +880,52 @@ export default function GeoFind() {
   const [follow, setFollow] = useState(true);
   const [recenterKey, setRecenterKey] = useState(0);
   const [focus, setFocus] = useState(null);
+  const [tab, setTab] = useState("map");
+  const { routes, create: createRoute, update: updateRoute, remove: removeRoute, recordRun, reminders, dismiss } = useRoutes();
+  const [activeRoute, setActiveRoute] = useState(null);
+  const [shownRoute, setShownRoute] = useState(null);
+  const [fitKey, setFitKey] = useState(0);
+  const activeStartRef = useRef(0);
+
   const focusOn = (lat, lng) => {
+    setTab("map");
     setFollow(false);          // stop auto-following so the map stays where we flew to
     setSheetOpen(false);       // reveal the map on phones
     setFocus({ lat, lng });
   };
+  const showRoute = (route) => {
+    setShownRoute(route); setFitKey((k) => k + 1);
+    setTab("map"); setFollow(false); setSheetOpen(false);
+  };
+  const startRoute = (route) => {
+    setActiveRoute(route); setShownRoute(route); setFitKey((k) => k + 1);
+    activeStartRef.current = Date.now();
+    dismiss(`${route.id}-${route.notifiedFor}`);
+    setTab("map"); setFollow(true); setSheetOpen(false);
+    if (!tracking) start();
+  };
+  const endRoute = () => { setActiveRoute(null); setShownRoute(null); };
+  const displayRoute = activeRoute ?? shownRoute;
+
+  const remainingM = useMemo(() => {
+    if (!activeRoute || !latest || latest.sourceHint === "ip") return null;
+    return turf.distance(turf.point([latest.lng, latest.lat]), turf.point([activeRoute.to.lng, activeRoute.to.lat]), { units: "meters" });
+  }, [activeRoute, latest]);
+
+  // Arrival detection for the route in progress.
+  useEffect(() => {
+    if (!activeRoute || remainingM == null || (latest.accuracy ?? 999) > 150) return;
+    if (remainingM <= Math.max(75, latest.accuracy ?? 0)) {
+      recordRun(activeRoute.id, { startedAt: activeStartRef.current, arrivedAt: Date.now() });
+      setAlert(`Arrived at ${activeRoute.to.label.split(",")[0]} 🎉`);
+      setTimeout(() => setAlert(null), 6000);
+      setActiveRoute(null);
+      setShownRoute(null);
+    }
+  }, [remainingM, activeRoute, latest, recordRun]);
+
+  const upcomingCount = routes.filter((r) => { const k = routeStatus(r).kind; return k === "soon" || k === "upcoming"; }).length;
+  const pendingNames = useMemo(() => points.filter((pt) => !pt.place && pt.sourceHint !== "ip").length, [points]);
   useEffect(() => {
     try { localStorage.setItem(STYLE_KEY, styleId); } catch {}
   }, [styleId]);
@@ -994,7 +976,32 @@ export default function GeoFind() {
     <>
       <style>{STYLES}</style>
       <Navbar installed={installed} onInstall={handleInstall} tracking={tracking} theme={theme} onToggleTheme={toggleTheme} />
-      <div className="gf-shell">
+      <Tabs tab={tab} onTab={setTab} upcoming={upcomingCount} />
+      {reminders.length > 0 && (
+        <div className="gf-banners">
+          {reminders.map((rm) => {
+            const route = routes.find((r) => r.id === rm.routeId);
+            return (
+              <div key={rm.id} className="gf-banner" role="alert">
+                <span>⏰ {rm.text}</span>
+                {route && <button onClick={() => { startRoute(route); dismiss(rm.id); }}>Start</button>}
+                <button className="ghost" onClick={() => dismiss(rm.id)}>Dismiss</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {tab === "history" && (
+        <HistoryPage points={points} loaded={loaded} distanceKm={distanceKm} pendingNames={pendingNames} onShow={focusOn} onClear={clear} />
+      )}
+      {tab === "routes" && (
+        <RoutesPage
+          routes={routes} latest={latest} activeId={activeRoute?.id}
+          onCreate={createRoute} onUpdate={updateRoute} onDelete={(id) => { removeRoute(id); if (activeRoute?.id === id) endRoute(); }}
+          onShow={showRoute} onStart={startRoute}
+        />
+      )}
+      <div className={`gf-shell ${tab === "map" ? "" : "gf-hidden"}`}>
         <div className="gf-map-wrap">
                    <MapView
             points={points}
@@ -1007,6 +1014,9 @@ export default function GeoFind() {
             follow={follow}
             recenterKey={recenterKey}
             focus={focus}
+            route={displayRoute}
+            fitKey={fitKey}
+            visible={tab === "map"}
           />
           <MapControls
             styleId={styleId}
@@ -1016,6 +1026,19 @@ export default function GeoFind() {
             onRecenter={() => setRecenterKey((k) => k + 1)}
             canRecenter={!!latest}
           />
+          {displayRoute && (
+            <div className="gf-routechip">
+              <span className="gf-rc-main">
+                <b>{activeRoute ? "→ " : ""}{displayRoute.name}</b>
+                <small>
+                  {activeRoute
+                    ? (remainingM != null ? `${fmtDist(remainingM)} to destination (straight line) · route ${fmtDist(displayRoute.distanceM)}` : `Waiting for a GPS fix… route ${fmtDist(displayRoute.distanceM)}`)
+                    : `${fmtDist(displayRoute.distanceM)} · ${displayRoute.to.label.split(",")[0]}`}
+                </small>
+              </span>
+              <button onClick={endRoute}>{activeRoute ? "End" : "Hide"}</button>
+            </div>
+          )}
           {alert && (
             <div className={`gf-toast ${/^(Entered|Left)/.test(alert) ? (insideGeofence ? "ok" : "bad") : "info"}`}>{alert}</div>
           )}
@@ -1068,12 +1091,15 @@ export default function GeoFind() {
             setIndex={setPlaybackIdx}
             onReset={() => setPlaybackIdx(Math.max(0, points.length - 1))}
           />
-          <InsightsPanel points={points} distanceKm={distanceKm} onFocus={focusOn} />
-          <DataPanel points={points} loaded={loaded} onClear={clear} />
+          <button className="gf-histlink" onClick={() => setTab("history")}>
+            <span><b>{loaded ? points.length.toLocaleString() : "…"}</b> saved locations</span>
+            <span>History &amp; insights →</span>
+          </button>
           <div className="gf-privacy">
             <strong>Privacy</strong>
             <ul>
-              <li>Every location is saved only in this browser (IndexedDB) and never uploaded; export it any time.</li>
+              <li>Every location is saved only in this browser (IndexedDB), with its place name; export it any time.</li>
+              <li>Place names, place search and routes use OpenStreetMap services (Nominatim, routing.openstreetmap.de), which receive the coordinates/places involved.</li>
               <li>IP mode sends a request to a public IP-lookup service (ipwho.is / ipapi.co), which sees your IP address.</li>
               <li>Press <b>Stop</b> any time; <b>Clear data</b> deletes all points.</li>
               <li>Geofence only watches your own device.</li>
@@ -1092,7 +1118,7 @@ const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
   :root {
-    --nav-h: 56px; --primary:#2563eb; --primary-d:#1d4ed8; --ink:#0f172a; --muted:#64748b;
+    --nav-h: 56px; --chrome-h: calc(56px + 46px + env(safe-area-inset-top)); --primary:#2563eb; --primary-d:#1d4ed8; --ink:#0f172a; --muted:#64748b;
     --line:#e2e8f0; --card:#f8fafc; --radius:14px;
   }
   .gf-shell, .gf-nav, .gf-side { font-family: 'Inter', system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
@@ -1125,7 +1151,7 @@ const STYLES = `
   /* ---------- Layout ---------- */
   .gf-shell {
     display:grid; grid-template-columns: 1fr 400px; background:#f1f5f9;
-    height: calc(100vh - var(--nav-h)); height: calc(100dvh - var(--nav-h) - env(safe-area-inset-top));
+    height: calc(100vh - var(--chrome-h)); height: calc(100dvh - var(--chrome-h));
   }
   .gf-map-wrap { position:relative; height:100%; min-height:0; }
   .gf-side {
@@ -1162,6 +1188,10 @@ const STYLES = `
   .gf-area-main b { display:block; font-size:13px; color:var(--ink); font-variant-numeric:tabular-nums; }
   .gf-area-main small { display:block; font-size:11px; color:var(--muted); margin-top:1px; }
   [data-theme="dark"] .gf-area, [data-theme="dark"] .gf-tile-btn { background:#0f172a; }
+  .gf-histlink { width:100%; display:flex; justify-content:space-between; align-items:center; gap:10px; padding:13px 14px; margin-bottom:16px; border:1px solid var(--line); border-radius:var(--radius); background:var(--card); color:var(--muted); font:500 13px 'Inter',system-ui,sans-serif; cursor:pointer; text-align:left; }
+  .gf-histlink b { color:var(--ink); font-size:17px; }
+  .gf-histlink span:last-child { color:var(--primary-d); font-weight:600; }
+  .gf-histlink:hover { border-color:var(--primary); }
   .gf-data { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:14px; margin-bottom:16px; }
   .gf-data-head { display:flex; justify-content:space-between; align-items:baseline; font-size:13px; color:var(--ink); margin-bottom:4px; }
   .gf-data-count { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
