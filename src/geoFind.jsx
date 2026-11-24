@@ -35,9 +35,10 @@ const STORAGE_KEY = "geofind_points_v1";
 const MAX_POINTS = 5000;
 const DEFAULT_CENTER = [0.3476, 32.5825]; // Kampala
 const MODE_KEY = "geofind_mode_v1";
+const GPS_ONLY_KEY = "geofind_gpsonly_v1";
 const IP_ACCURACY_M = 5000; // IP geolocation is typically city-level
 const IP_POLL_MS = 60000;
-const GPS_RETRY_MS = 20000;
+const GPS_MAX_ACCURACY_M = 50; // fixes coarser than this are treated as Wi-Fi/cell
 
 // Free, key-less IP geolocation services (HTTPS + CORS). Tried in order.
 async function fetchIpLocation() {
@@ -88,10 +89,16 @@ function useHybridTracking() {
     try { return localStorage.getItem(MODE_KEY) === "ip" ? "ip" : "gps"; } catch { return "gps"; }
   });
 
+  const [gpsOnly, setGpsOnlyState] = useState(() => {
+    try { return localStorage.getItem(GPS_ONLY_KEY) !== "0"; } catch { return true; }
+  });
+  const setGpsOnly = useCallback((v) => {
+    setGpsOnlyState(v);
+    try { localStorage.setItem(GPS_ONLY_KEY, v ? "1" : "0"); } catch { /* ignore */ }
+  }, []);
+
   const watchIdRef = useRef(null);
   const ipTimerRef = useRef(null);
-  const gpsRetryRef = useRef(null);
-  const startRef = useRef(null);
   const wakeLockRef = useRef(null);
 
   // Keep the screen awake while tracking (browsers pause GPS when the screen locks).
@@ -160,27 +167,13 @@ function useHybridTracking() {
       clearInterval(ipTimerRef.current);
       ipTimerRef.current = null;
     }
-    if (gpsRetryRef.current != null) {
-      clearInterval(gpsRetryRef.current);
-      gpsRetryRef.current = null;
-    }
     setTracking(false);
   }, []);
 
   // ---- IP-address tracking (city-level, works without GPS permission) ------
-  const startIp = useCallback((notice, retryGps = false) => {
+  const startIp = useCallback(() => {
     if (ipTimerRef.current != null) return;
-    // When IP is only a fallback, keep probing GPS and upgrade as soon as it works.
-    if (retryGps && "geolocation" in navigator) {
-      gpsRetryRef.current = setInterval(() => {
-        navigator.geolocation.getCurrentPosition(
-          () => { stop(); startRef.current?.(); },
-          () => {},
-          { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-        );
-      }, GPS_RETRY_MS);
-    }
-    setError(notice ?? null);
+    setError(null);
     setTracking(true);
     const poll = async () => {
       try {
@@ -203,7 +196,7 @@ function useHybridTracking() {
     };
     poll();
     ipTimerRef.current = setInterval(poll, IP_POLL_MS);
-  }, [addPoint, stop]);
+  }, [addPoint]);
 
   const changeMode = useCallback((m) => {
     stop();
@@ -214,50 +207,55 @@ function useHybridTracking() {
   const start = useCallback(() => {
     if (watchIdRef.current != null || ipTimerRef.current != null) return; // already running
     if (mode === "ip") { startIp(); return; }
+
+    // GPS / Device mode never falls back to IP: it uses the device's location or nothing.
     if (!("geolocation" in navigator)) {
-      startIp("GPS isn't supported here — using your IP address (approximate).");
+      setError("This browser doesn't support device location.");
       return;
     }
     if (!window.isSecureContext) {
-      startIp("GPS needs HTTPS — using your IP address instead (approximate).");
+      setError("Device GPS is blocked on plain http:// pages. Open the app on https:// (or http://localhost on this computer) — see the README.");
       return;
-    }    setError(null);
+    }
+    setError(null);
     setTracking(true);
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (pos) => {
         const { latitude, longitude, accuracy } = pos.coords;
+        // Browsers don't say whether a fix came from GPS, Wi-Fi or cell towers; the
+        // accuracy is the tell (GPS is tens of metres or better, network fixes are coarser).
+        if (gpsOnly && accuracy > GPS_MAX_ACCURACY_M) {
+          setError(`Waiting for a real GPS fix… best available is ±${Math.round(accuracy)} m (Wi‑Fi/cell), which is ignored. Go outdoors/near a window, or untick “GPS only”.`);
+          return;
+        }
+        setError(null);
         const speed = Number.isFinite(pos.coords.speed) ? pos.coords.speed : null;
-        const newPt = {
+        addPoint({
           id: (crypto.randomUUID?.() ?? String(Date.now())),
           lat: latitude,
           lng: longitude,
           accuracy,
           speed,
           timestamp: pos.timestamp,
-          sourceHint:
-            accuracy <= 20 ? "gps" : accuracy <= 50 ? "hybrid" : "network",
-        };
-        addPoint(newPt);
+          sourceHint: accuracy <= 20 ? "gps" : accuracy <= 50 ? "hybrid" : "network",
+        });
       },
       (err) => {
-        if (err.code === 1 || err.code === 2) {
-          // Permission denied / no GPS: fall back to IP-based location.
+        if (err.code === 1) {
           stop();
-          startIp(
-            err.code === 1
-              ? "Location permission denied — showing an approximate IP location (often the wrong city). Allow location for this site and it will switch to GPS automatically."
-              : "Device location unavailable — showing an approximate IP location (often the wrong city). Turn on Location in your device settings; it will switch to GPS automatically.",
-            true
-          );
-          return;
+          setError("Location permission denied. Allow location for this site in your browser settings, then press Start again.");
+        } else if (err.code === 2) {
+          setError("Device location unavailable. Turn on Location / GPS in your device settings.");
+        } else if (err.code === 3) {
+          setError("Still searching for a GPS signal…");
+        } else {
+          setError(err.message || "Geolocation error");
         }
-        setError(err.code === 3 ? "Timed out getting location. Retrying…" : err.message || "Geolocation error");
       },
-      { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 }
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 }
     );
-  }, [stop, startIp, addPoint, mode]);
-  useEffect(() => { startRef.current = start; }, [start]);
+  }, [stop, startIp, addPoint, mode, gpsOnly]);
 
   const clear = useCallback(() => {
     stop();
@@ -268,7 +266,7 @@ function useHybridTracking() {
   useEffect(() => () => stop(), [stop]);
 
   const latest = points.length ? points[points.length - 1] : null;
-  return { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode };
+  return { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode, gpsOnly, setGpsOnly };
 }
 
 // ---- PWA install hook ------------------------------------------------------
@@ -575,7 +573,7 @@ function MapView({ points, latest, geofence, insideGeofence, playbackPoint, show
 // 3) Panels
 // ===========================================================================
 function ControlBar({
-  mode, onModeChange,
+  mode, onModeChange, gpsOnly, onGpsOnlyChange,
   tracking, onStart, onStop, onClear,
   geofenceOn, onToggleGeofence,
   showHeatmap, onToggleHeatmap,
@@ -592,6 +590,12 @@ function ControlBar({
           🌐 IP address
         </button>
       </div>
+      {mode === "gps" && (
+        <label className="gf-toggle gf-gpsonly">
+          <input type="checkbox" checked={gpsOnly} onChange={(e) => onGpsOnlyChange(e.target.checked)} />
+          GPS only <small>(ignore Wi‑Fi / cell-tower fixes)</small>
+        </label>
+      )}
       <div className={`gf-badge ${tracking ? "on" : "off"}`}>
         {tracking ? "● Tracking ON" : "○ Tracking OFF"}
       </div>
@@ -688,7 +692,7 @@ function PlaybackControls({ points, index, setIndex, onReset }) {
 // 4) Root component
 // ===========================================================================
 export default function GeoFind() {
-  const { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode } = useHybridTracking();
+  const { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode, gpsOnly, setGpsOnly } = useHybridTracking();
 
   const [geofenceOn, setGeofenceOn] = useState(false);
   const [showHeatmap, setShowHeatmap] = useState(false);
@@ -793,6 +797,8 @@ export default function GeoFind() {
           <ControlBar
             mode={mode}
             onModeChange={changeMode}
+            gpsOnly={gpsOnly}
+            onGpsOnlyChange={setGpsOnly}
             tracking={tracking}
             onStart={start}
             onStop={stop}
@@ -905,6 +911,7 @@ const STYLES = `
   [data-theme="dark"] .gf-controlbar .gf-seg button { background:transparent; color:#94a3b8; }
   [data-theme="dark"] .gf-controlbar .gf-seg button:hover { background:#273449; }
   [data-theme="dark"] .gf-controlbar .gf-seg button.sel { background:#0f172a; color:#93c5fd; }
+  .gf-gpsonly { width:100%; box-sizing:border-box; } .gf-gpsonly small { color:var(--muted); font-weight:400; }
   .gf-badge { padding:7px 12px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.3px; }
   .gf-badge.on { background:#dcfce7; color:#166534; }
   .gf-badge.off { background:#f1f5f9; color:#475569; }

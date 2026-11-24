@@ -18,13 +18,12 @@ Open http://localhost:5173 and press **Start tracking**. Allow the location perm
 
 > `localhost` counts as a secure context, so location works. The service worker / install button are only active in production builds (see below).
 
-### Try it on your phone (same Wi-Fi)
+### Try it on your phone
 
-```bash
-npm run dev -- --host
-```
+GPS only works on a secure page (`https://` or `http://localhost`). Opening the dev server by its LAN address (`http://192.168.x.x:5173`) is **not** secure, so the phone will refuse to give a location there. Use one of these instead:
 
-Open the printed `Network` URL on your phone. Note: browsers block geolocation on plain `http://` addresses other than localhost, so for real phone testing use the HTTPS deployment below.
+- **Deploy** the `dist/` folder to an HTTPS host (see below) and open that URL on the phone. This is the most reliable option.
+- **Temporary HTTPS tunnel** to the dev server, e.g. `npx cloudflared tunnel --url http://localhost:5173` (or `npx localtunnel --port 5173`), then open the `https://` URL it prints on the phone.
 
 ## Run as a production build (PWA install works here)
 
@@ -61,7 +60,8 @@ Then open the site on your phone, allow location, and tap **Download app** (iOS 
 
 - Uses `navigator.geolocation.watchPosition` with high accuracy; modern phones fuse GPS + Wi-Fi + cell.
 - The screen is kept awake while tracking (Wake Lock), because browsers pause GPS when the screen locks. Web apps cannot track in the background.
-- **IP address mode**: switch the source to *IP address* in the panel to locate the device from its public IP via ipwho.is (fallback ipapi.co). It needs no GPS or permission, so it also works over plain HTTP, but it is only city-level accurate (a dashed purple circle shows the uncertainty) and refreshes every 60 s. It also kicks in automatically if GPS is denied, unavailable, or the page isn't served over HTTPS. Note this sends a request to those third-party services, which see your IP.
+- **GPS / Device mode** uses only the device's location and never falls back to IP. Browsers don't say whether a fix came from GPS, Wi-Fi or cell towers, so with **GPS only** ticked (default) fixes coarser than ±50 m are ignored and the panel says it is still waiting for a real GPS fix. Untick it to also accept Wi-Fi/cell-tower positions (usually accurate to tens–hundreds of metres, and correct city). Laptops have no GPS chip, so they need it unticked.
+- **IP address mode** is a separate, manual choice: it locates the device from its public IP via ipwho.is (fallback ipapi.co). It needs no permission but is only city-level and often shows the ISP hub (for example Kampala instead of Mbarara). A dashed purple circle shows the uncertainty; it refreshes every 60 s. This sends a request to those third-party services, which see your IP.
 - Points are stored only in your browser (`localStorage`). **Clear data** deletes them.
 
 ## Troubleshooting
