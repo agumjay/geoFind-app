@@ -37,6 +37,7 @@ const DEFAULT_CENTER = [0.3476, 32.5825]; // Kampala
 const MODE_KEY = "geofind_mode_v1";
 const IP_ACCURACY_M = 5000; // IP geolocation is typically city-level
 const IP_POLL_MS = 60000;
+const GPS_RETRY_MS = 20000;
 
 // Free, key-less IP geolocation services (HTTPS + CORS). Tried in order.
 async function fetchIpLocation() {
@@ -89,6 +90,8 @@ function useHybridTracking() {
 
   const watchIdRef = useRef(null);
   const ipTimerRef = useRef(null);
+  const gpsRetryRef = useRef(null);
+  const startRef = useRef(null);
   const wakeLockRef = useRef(null);
 
   // Keep the screen awake while tracking (browsers pause GPS when the screen locks).
@@ -136,7 +139,14 @@ function useHybridTracking() {
           last.lat === newPt.lat && last.lng === newPt.lng) {
         return [...prev.slice(0, -1), { ...last, timestamp: newPt.timestamp }];
       }
-      const next = [...prev, newPt];
+      // A real GPS/network fix supersedes trailing IP guesses (avoids a bogus long jump in the trail/distance).
+      let base = prev;
+      if (newPt.sourceHint !== "ip") {
+        let n = base.length;
+        while (n > 0 && base[n - 1].sourceHint === "ip") n--;
+        base = base.slice(0, n);
+      }
+      const next = [...base, newPt];
       return next.length > MAX_POINTS ? next.slice(next.length - MAX_POINTS) : next;
     });
   }, []);
@@ -150,12 +160,26 @@ function useHybridTracking() {
       clearInterval(ipTimerRef.current);
       ipTimerRef.current = null;
     }
+    if (gpsRetryRef.current != null) {
+      clearInterval(gpsRetryRef.current);
+      gpsRetryRef.current = null;
+    }
     setTracking(false);
   }, []);
 
   // ---- IP-address tracking (city-level, works without GPS permission) ------
-  const startIp = useCallback((notice) => {
+  const startIp = useCallback((notice, retryGps = false) => {
     if (ipTimerRef.current != null) return;
+    // When IP is only a fallback, keep probing GPS and upgrade as soon as it works.
+    if (retryGps && "geolocation" in navigator) {
+      gpsRetryRef.current = setInterval(() => {
+        navigator.geolocation.getCurrentPosition(
+          () => { stop(); startRef.current?.(); },
+          () => {},
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+      }, GPS_RETRY_MS);
+    }
     setError(notice ?? null);
     setTracking(true);
     const poll = async () => {
@@ -179,7 +203,7 @@ function useHybridTracking() {
     };
     poll();
     ipTimerRef.current = setInterval(poll, IP_POLL_MS);
-  }, [addPoint]);
+  }, [addPoint, stop]);
 
   const changeMode = useCallback((m) => {
     stop();
@@ -197,8 +221,7 @@ function useHybridTracking() {
     if (!window.isSecureContext) {
       startIp("GPS needs HTTPS — using your IP address instead (approximate).");
       return;
-    }
-    setError(null);
+    }    setError(null);
     setTracking(true);
 
     watchIdRef.current = navigator.geolocation.watchPosition(
@@ -223,8 +246,9 @@ function useHybridTracking() {
           stop();
           startIp(
             err.code === 1
-              ? "Location permission denied — using your IP address instead (approximate)."
-              : "GPS unavailable — using your IP address instead (approximate)."
+              ? "Location permission denied — showing an approximate IP location (often the wrong city). Allow location for this site and it will switch to GPS automatically."
+              : "Device location unavailable — showing an approximate IP location (often the wrong city). Turn on Location in your device settings; it will switch to GPS automatically.",
+            true
           );
           return;
         }
@@ -233,6 +257,7 @@ function useHybridTracking() {
       { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 }
     );
   }, [stop, startIp, addPoint, mode]);
+  useEffect(() => { startRef.current = start; }, [start]);
 
   const clear = useCallback(() => {
     stop();
