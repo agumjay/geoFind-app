@@ -62,7 +62,8 @@ Then open the site on your phone, allow location, and tap **Download app** (iOS 
 - The screen is kept awake while tracking (Wake Lock), because browsers pause GPS when the screen locks. Web apps cannot track in the background.
 - **GPS / Device mode** uses only the device's location and never falls back to IP. Browsers don't say whether a fix came from GPS, Wi-Fi or cell towers, so with **GPS only** ticked (default) fixes coarser than ±50 m are ignored and the panel says it is still waiting for a real GPS fix. Untick it to also accept Wi-Fi/cell-tower positions (usually accurate to tens–hundreds of metres, and correct city). Laptops have no GPS chip, so they need it unticked.
 - **IP address mode** is a separate, manual choice: it locates the device from its public IP via ipwho.is (fallback ipapi.co). It needs no permission but is only city-level and often shows the ISP hub (for example Kampala instead of Mbarara). A dashed purple circle shows the uncertainty; it refreshes every 60 s. This sends a request to those third-party services, which see your IP.
-- Points are stored only in your browser (`localStorage`). **Clear data** deletes them.
+- **Every location is saved** (IndexedDB, no point limit) and survives reloads. Old localStorage data is migrated automatically. Use **Export CSV / GeoJSON** to back it up; **Delete all** / **Clear data** (with confirmation) removes it.
+- **Insights** are computed from all saved GPS points: top speed (and where), average moving speed, total distance, time tracked, farthest point from the start, and the five most visited areas (~330 m grid, with visit count and time spent). Tap an item to jump to it on the map. IP-based guesses are excluded.
 
 ## Troubleshooting
 

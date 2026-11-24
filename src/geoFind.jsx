@@ -32,7 +32,142 @@ L.Icon.Default.mergeOptions({ iconRetinaUrl, iconUrl, shadowUrl });
 
 // ---- Constants -------------------------------------------------------------
 const STORAGE_KEY = "geofind_points_v1";
-const MAX_POINTS = 5000;
+const DB_NAME = "geofind";
+const DB_STORE = "points";
+
+// ---- Persistent store (IndexedDB): keeps EVERY location ever collected ------
+// localStorage caps out around 5 MB; IndexedDB scales to hundreds of thousands of points.
+let dbPromise = null;
+function openDb() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      if (!("indexedDB" in window)) { reject(new Error("IndexedDB unavailable")); return; }
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const st = req.result.createObjectStore(DB_STORE, { keyPath: "id" });
+        st.createIndex("timestamp", "timestamp");
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    dbPromise.catch(() => { dbPromise = null; });
+  }
+  return dbPromise;
+}
+async function dbTx(mode, fn) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, mode);
+    const out = fn(tx.objectStore(DB_STORE));
+    tx.oncomplete = () => resolve(out?.result);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+const dbAll = () => dbTx("readonly", (st) => st.getAll());
+const dbPut = (pt) => dbTx("readwrite", (st) => st.put(pt)).catch(() => {});
+const dbPutMany = (pts) => dbTx("readwrite", (st) => { pts.forEach((p) => st.put(p)); }).catch(() => {});
+const dbClear = () => dbTx("readwrite", (st) => st.clear()).catch(() => {});
+
+// Consecutive points of the same kind (IP guess vs device fix) form one segment, so the
+// trail/distance never draws a bogus long line between an IP guess and a real fix.
+function toSegments(points) {
+  const segs = [];
+  for (const p of points) {
+    const ip = p.sourceHint === "ip";
+    const cur = segs[segs.length - 1];
+    if (cur && cur.ip === ip) cur.pts.push(p);
+    else segs.push({ ip, pts: [p] });
+  }
+  return segs;
+}
+
+const CELL_DEG = 0.003;      // ~330 m grid used to group "areas"
+const MAX_GAP_S = 300;       // gaps longer than this aren't counted as time spent
+const MAX_SANE_MPS = 120;    // ignore GPS spikes faster than ~430 km/h
+
+function computeInsights(points) {
+  const pts = points.filter((p) => p.sourceHint !== "ip"); // IP guesses are not real movement
+  if (!pts.length) return null;
+  let maxSpeed = null, movingDist = 0, movingTime = 0, activeTime = 0;
+  const cells = new Map();
+  const first = pts[0];
+  let farthest = { km: 0, point: first };
+  let prevCell = null;
+
+  pts.forEach((p, i) => {
+    const key = `${Math.round(p.lat / CELL_DEG)}:${Math.round(p.lng / CELL_DEG)}`;
+    let c = cells.get(key);
+    if (!c) { c = { key, n: 0, visits: 0, dwell: 0, lat: 0, lng: 0, last: 0 }; cells.set(key, c); }
+    c.n++; c.lat += p.lat; c.lng += p.lng; c.last = p.timestamp;
+    if (key !== prevCell) c.visits++;
+    prevCell = key;
+
+    const d0 = turf.distance(turf.point([first.lng, first.lat]), turf.point([p.lng, p.lat]), { units: "kilometers" });
+    if (d0 > farthest.km) farthest = { km: d0, point: p };
+
+    if (i === 0) return;
+    const q = pts[i - 1];
+    const dt = (p.timestamp - q.timestamp) / 1000;
+    if (dt <= 0 || dt > MAX_GAP_S) return;
+    activeTime += dt;
+    const prevKey = `${Math.round(q.lat / CELL_DEG)}:${Math.round(q.lng / CELL_DEG)}`;
+    cells.get(prevKey).dwell += dt;
+
+    const dKm = turf.distance(turf.point([q.lng, q.lat]), turf.point([p.lng, p.lat]), { units: "kilometers" });
+    let v = Number.isFinite(p.speed) ? p.speed : null;           // m/s reported by the device
+    if (v == null && dt >= 1 && (p.accuracy ?? 99) <= 50 && (q.accuracy ?? 99) <= 50) v = (dKm * 1000) / dt;
+    if (v != null && v <= MAX_SANE_MPS) {
+      if (!maxSpeed || v > maxSpeed.mps) maxSpeed = { mps: v, point: p };
+      if (v > 0.5) { movingTime += dt; movingDist += dKm; }
+    }
+  });
+
+  const areas = [...cells.values()]
+    .map((c) => ({ ...c, lat: c.lat / c.n, lng: c.lng / c.n }))
+    .sort((a, b) => b.visits - a.visits || b.dwell - a.dwell)
+    .slice(0, 5);
+  const days = new Set(pts.map((p) => new Date(p.timestamp).toDateString())).size;
+
+  return {
+    maxSpeed,
+    avgMovingKmh: movingTime > 0 ? movingDist / (movingTime / 3600) : null,
+    activeTime, days, areas, farthest,
+    totalPoints: pts.length,
+  };
+}
+function fmtDuration(sec) {
+  if (!sec || sec < 60) return `${Math.round(sec || 0)} s`;
+  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+  return h ? `${h} h ${m} m` : `${m} min`;
+}
+
+function download(filename, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function exportCsv(points) {
+  const head = ["timestamp_iso", "lat", "lng", "accuracy_m", "speed_mps", "source", "place"];
+  const rows = points.map((p) => [
+    new Date(p.timestamp).toISOString(), p.lat, p.lng, Math.round(p.accuracy ?? 0), p.speed ?? "", p.sourceHint ?? "",
+    `"${(p.place ?? "").replace(/"/g, '""')}"`,
+  ].join(","));
+  download("geofind-locations.csv", [head.join(","), ...rows].join("\n"), "text/csv");
+}
+function exportGeoJson(points) {
+  const fc = {
+    type: "FeatureCollection",
+    features: points.map((p) => ({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: [p.lng, p.lat] },
+      properties: { time: new Date(p.timestamp).toISOString(), accuracy: p.accuracy, speed: p.speed, source: p.sourceHint, place: p.place },
+    })),
+  };
+  download("geofind-locations.geojson", JSON.stringify(fc), "application/geo+json");
+}
 const DEFAULT_CENTER = [0.3476, 32.5825]; // Kampala
 const MODE_KEY = "geofind_mode_v1";
 const GPS_ONLY_KEY = "geofind_gpsonly_v1";
@@ -74,14 +209,9 @@ async function fetchIpLocation() {
 // ===========================================================================
 function useHybridTracking() {
   const [tracking, setTracking] = useState(false);
-  const [points, setPoints] = useState(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [points, setPoints] = useState([]);
+  const pointsRef = useRef([]);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(null);
   const [distanceKm, setDistanceKm] = useState(0);
 
@@ -123,39 +253,61 @@ function useHybridTracking() {
     };
   }, [tracking]);
 
+  // Load the full history from IndexedDB (and migrate the old localStorage copy once).
   useEffect(() => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(points)); } catch {}
-  }, [points]);
+    let alive = true;
+    (async () => {
+      let stored = [];
+      try {
+        stored = await dbAll();
+        const legacy = localStorage.getItem(STORAGE_KEY);
+        if (legacy) {
+          const old = JSON.parse(legacy);
+          if (Array.isArray(old) && old.length) { await dbPutMany(old); stored = await dbAll(); }
+          localStorage.removeItem(STORAGE_KEY);
+        }
+        navigator.storage?.persist?.(); // ask the browser not to evict our data
+      } catch { /* storage unavailable: keep working in memory */ }
+      if (!alive) return;
+      const ids = new Set(stored.map((p) => p.id));
+      const merged = [...stored, ...pointsRef.current.filter((p) => !ids.has(p.id))]
+        .sort((x, y) => x.timestamp - y.timestamp);
+      pointsRef.current = merged;
+      setPoints(merged);
+      setLoaded(true);
+    })();
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
-    if (points.length < 2) { setDistanceKm(0); return; }
     let total = 0;
-    for (let i = 1; i < points.length; i++) {
-      const a = turf.point([points[i - 1].lng, points[i - 1].lat]);
-      const b = turf.point([points[i].lng, points[i].lat]);
-      total += turf.distance(a, b, { units: "kilometers" });
+    for (const seg of toSegments(points)) {
+      if (seg.ip) continue; // IP guesses are not real movement
+      for (let i = 1; i < seg.pts.length; i++) {
+        const a = turf.point([seg.pts[i - 1].lng, seg.pts[i - 1].lat]);
+        const b = turf.point([seg.pts[i].lng, seg.pts[i].lat]);
+        total += turf.distance(a, b, { units: "kilometers" });
+      }
     }
     setDistanceKm(total);
   }, [points]);
 
   const addPoint = useCallback((newPt) => {
-    setPoints((prev) => {
-      const last = prev[prev.length - 1];
-      // IP lookups often return the same spot: refresh the timestamp instead of piling up points.
-      if (newPt.sourceHint === "ip" && last && last.sourceHint === "ip" &&
-          last.lat === newPt.lat && last.lng === newPt.lng) {
-        return [...prev.slice(0, -1), { ...last, timestamp: newPt.timestamp }];
-      }
-      // A real GPS/network fix supersedes trailing IP guesses (avoids a bogus long jump in the trail/distance).
-      let base = prev;
-      if (newPt.sourceHint !== "ip") {
-        let n = base.length;
-        while (n > 0 && base[n - 1].sourceHint === "ip") n--;
-        base = base.slice(0, n);
-      }
-      const next = [...base, newPt];
-      return next.length > MAX_POINTS ? next.slice(next.length - MAX_POINTS) : next;
-    });
+    const prev = pointsRef.current;
+    const last = prev[prev.length - 1];
+    let next;
+    // Repeat IP lookups return the same spot: refresh the timestamp instead of piling up rows.
+    if (newPt.sourceHint === "ip" && last && last.sourceHint === "ip" &&
+        last.lat === newPt.lat && last.lng === newPt.lng) {
+      const updated = { ...last, timestamp: newPt.timestamp };
+      next = [...prev.slice(0, -1), updated];
+      dbPut(updated);
+    } else {
+      next = [...prev, newPt];
+      dbPut(newPt);
+    }
+    pointsRef.current = next;
+    setPoints(next);
   }, []);
 
   const stop = useCallback(() => {
@@ -259,14 +411,15 @@ function useHybridTracking() {
 
   const clear = useCallback(() => {
     stop();
+    pointsRef.current = [];
     setPoints([]);
-    try { localStorage.removeItem(STORAGE_KEY); } catch {}
+    dbClear();
   }, [stop]);
 
   useEffect(() => () => stop(), [stop]);
 
   const latest = points.length ? points[points.length - 1] : null;
-  return { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode, gpsOnly, setGpsOnly };
+  return { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode, gpsOnly, setGpsOnly, loaded };
 }
 
 // ---- PWA install hook ------------------------------------------------------
@@ -375,8 +528,11 @@ function Navbar({ installed, onInstall, tracking, theme, onToggleTheme }) {
 // ===========================================================================
 // 2) Map sub-components
 // ===========================================================================
-function FlyToLatest({ latest, follow, recenterKey }) {
+function FlyToLatest({ latest, follow, recenterKey, target }) {
   const map = useMap();
+  useEffect(() => {
+    if (target) map.flyTo([target.lat, target.lng], Math.max(map.getZoom(), 16));
+  }, [target, map]);
   useEffect(() => {
     if (latest && follow) {
       // IP fixes are city-level: don't sit zoomed in on a street.
@@ -504,8 +660,8 @@ function HeatLayer({ points, show }) {
   return null;
 }
 
-function MapView({ points, latest, geofence, insideGeofence, playbackPoint, showHeatmap, styleId, follow, recenterKey }) {
-  const trail = points.map((p) => [p.lat, p.lng]);
+function MapView({ points, latest, geofence, insideGeofence, playbackPoint, showHeatmap, styleId, follow, recenterKey, focus }) {
+  const segments = toSegments(points).filter((sg) => sg.pts.length > 1);
   const center = latest ? [latest.lat, latest.lng] : DEFAULT_CENTER;
   const st = MAP_STYLES[styleId] ?? MAP_STYLES.street;
 
@@ -518,11 +674,17 @@ function MapView({ points, latest, geofence, insideGeofence, playbackPoint, show
         maxZoom={20}
         maxNativeZoom={st.maxZoom}
       />
-      <FlyToLatest latest={latest} follow={follow} recenterKey={recenterKey} />
+      <FlyToLatest latest={latest} follow={follow} recenterKey={recenterKey} target={focus} />
 
-      {trail.length > 1 && (
-        <Polyline positions={trail} pathOptions={{ color: "#2563eb", weight: 4 }} />
-      )}
+      {segments.map((sg, i) => (
+        <Polyline
+          key={i}
+          positions={sg.pts.map((p) => [p.lat, p.lng])}
+          pathOptions={sg.ip
+            ? { color: "#8b5cf6", weight: 3, dashArray: "6 8" }
+            : { color: "#2563eb", weight: 4 }}
+        />
+      ))}
 
       {latest && (
         <Marker position={[latest.lat, latest.lng]}>
@@ -604,7 +766,7 @@ function ControlBar({
       ) : (
         <button className="danger" onClick={onStop}>Stop</button>
       )}
-      <button onClick={onClear}>Clear data</button>
+      <button onClick={() => { if (window.confirm("Permanently delete all saved locations?")) onClear(); }}>Clear data</button>
       <label className="gf-toggle">
         <input type="checkbox" checked={geofenceOn} onChange={onToggleGeofence} /> Geofence
       </label>
@@ -672,6 +834,70 @@ function StatsPanel({ latest, distanceKm, points, error, geofenceStatus }) {
   );
 }
 
+function InsightsPanel({ points, distanceKm, onFocus }) {
+  const ins = useMemo(() => computeInsights(points), [points]);
+  if (!ins) return null;
+  const top = ins.maxSpeed;
+  return (
+    <div className="gf-insights">
+      <strong>Insights <small>from all saved locations</small></strong>
+      <div className="gf-tiles">
+        <button className="gf-tile gf-tile-btn" disabled={!top} onClick={() => top && onFocus(top.point.lat, top.point.lng)}
+                title="Show where this was recorded">
+          <span>Top speed</span>
+          <b>{top ? (top.mps * 3.6).toFixed(1) : "—"}</b>
+          <small>km/h{top ? ` · ${new Date(top.point.timestamp).toLocaleDateString()}` : ""}</small>
+        </button>
+        <div className="gf-tile"><span>Avg moving</span><b>{ins.avgMovingKmh != null ? ins.avgMovingKmh.toFixed(1) : "—"}</b><small>km/h</small></div>
+        <div className="gf-tile"><span>Total distance</span><b>{distanceKm.toFixed(2)}</b><small>km</small></div>
+        <div className="gf-tile"><span>Time tracked</span><b>{fmtDuration(ins.activeTime)}</b><small>{ins.days} day{ins.days === 1 ? "" : "s"}</small></div>
+        <button className="gf-tile gf-tile-btn" onClick={() => onFocus(ins.farthest.point.lat, ins.farthest.point.lng)} title="Show on map">
+          <span>Farthest from start</span><b>{ins.farthest.km.toFixed(2)}</b><small>km</small>
+        </button>
+        <div className="gf-tile"><span>GPS points</span><b>{ins.totalPoints.toLocaleString()}</b><small>recorded</small></div>
+      </div>
+      <div className="gf-areas">
+        <span className="gf-areas-title">Most visited areas</span>
+        {ins.areas.map((a, i) => (
+          <button key={a.key} className="gf-area" onClick={() => onFocus(a.lat, a.lng)}>
+            <i>{i + 1}</i>
+            <span className="gf-area-main">
+              <b>{a.lat.toFixed(4)}, {a.lng.toFixed(4)}</b>
+              <small>{a.visits} visit{a.visits === 1 ? "" : "s"} · {fmtDuration(a.dwell)} spent · last {new Date(a.last).toLocaleDateString()}</small>
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DataPanel({ points, loaded, onClear }) {
+  const first = points[0], last = points[points.length - 1];
+  const fmt = (t) => new Date(t).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  return (
+    <div className="gf-data">
+      <div className="gf-data-head">
+        <strong>Saved locations</strong>
+        <span className="gf-data-count">{loaded ? points.length.toLocaleString() : "…"}</span>
+      </div>
+      <small>
+        {points.length
+          ? `Every point is stored on this device · ${fmt(first.timestamp)} → ${fmt(last.timestamp)}`
+          : "Every location collected is saved on this device automatically."}
+      </small>
+      <div className="gf-data-actions">
+        <button disabled={!points.length} onClick={() => exportCsv(points)}>Export CSV</button>
+        <button disabled={!points.length} onClick={() => exportGeoJson(points)}>Export GeoJSON</button>
+        <button className="warn" disabled={!points.length}
+                onClick={() => { if (window.confirm(`Permanently delete all ${points.length} saved locations?`)) onClear(); }}>
+          Delete all
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function PlaybackControls({ points, index, setIndex, onReset }) {
   if (points.length < 2) return null;
   const p = points[index];
@@ -692,7 +918,7 @@ function PlaybackControls({ points, index, setIndex, onReset }) {
 // 4) Root component
 // ===========================================================================
 export default function GeoFind() {
-  const { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode, gpsOnly, setGpsOnly } = useHybridTracking();
+  const { tracking, start, stop, clear, points, latest, distanceKm, error, mode, changeMode, gpsOnly, setGpsOnly, loaded } = useHybridTracking();
 
   const [geofenceOn, setGeofenceOn] = useState(false);
   const [showHeatmap, setShowHeatmap] = useState(false);
@@ -712,6 +938,12 @@ export default function GeoFind() {
   });
   const [follow, setFollow] = useState(true);
   const [recenterKey, setRecenterKey] = useState(0);
+  const [focus, setFocus] = useState(null);
+  const focusOn = (lat, lng) => {
+    setFollow(false);          // stop auto-following so the map stays where we flew to
+    setSheetOpen(false);       // reveal the map on phones
+    setFocus({ lat, lng });
+  };
   useEffect(() => {
     try { localStorage.setItem(STYLE_KEY, styleId); } catch {}
   }, [styleId]);
@@ -774,6 +1006,7 @@ export default function GeoFind() {
             styleId={styleId}
             follow={follow}
             recenterKey={recenterKey}
+            focus={focus}
           />
           <MapControls
             styleId={styleId}
@@ -835,10 +1068,12 @@ export default function GeoFind() {
             setIndex={setPlaybackIdx}
             onReset={() => setPlaybackIdx(Math.max(0, points.length - 1))}
           />
+          <InsightsPanel points={points} distanceKm={distanceKm} onFocus={focusOn} />
+          <DataPanel points={points} loaded={loaded} onClear={clear} />
           <div className="gf-privacy">
             <strong>Privacy</strong>
             <ul>
-              <li>Data stored only in this browser.</li>
+              <li>Every location is saved only in this browser (IndexedDB) and never uploaded; export it any time.</li>
               <li>IP mode sends a request to a public IP-lookup service (ipwho.is / ipapi.co), which sees your IP address.</li>
               <li>Press <b>Stop</b> any time; <b>Clear data</b> deletes all points.</li>
               <li>Geofence only watches your own device.</li>
@@ -912,6 +1147,33 @@ const STYLES = `
   [data-theme="dark"] .gf-controlbar .gf-seg button:hover { background:#273449; }
   [data-theme="dark"] .gf-controlbar .gf-seg button.sel { background:#0f172a; color:#93c5fd; }
   .gf-gpsonly { width:100%; box-sizing:border-box; } .gf-gpsonly small { color:var(--muted); font-weight:400; }
+  .gf-insights { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:14px; margin-bottom:16px; }
+  .gf-insights > strong { display:block; font-size:13px; color:var(--ink); margin-bottom:10px; }
+  .gf-insights > strong small { color:var(--muted); font-weight:400; font-size:11px; margin-left:6px; }
+  .gf-tile-btn { text-align:left; font:inherit; cursor:pointer; transition:border-color .2s, transform .1s; }
+  .gf-tile-btn:hover:not(:disabled) { border-color:var(--primary); }
+  .gf-tile-btn:active:not(:disabled) { transform:scale(.98); }
+  .gf-tile-btn:disabled { cursor:default; }
+  .gf-areas { margin-top:12px; display:flex; flex-direction:column; gap:6px; }
+  .gf-areas-title { font-size:11px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+  .gf-area { display:flex; align-items:center; gap:10px; padding:9px 10px; border:1px solid var(--line); border-radius:10px; background:#fff; cursor:pointer; text-align:left; font:inherit; }
+  .gf-area:hover { border-color:var(--primary); }
+  .gf-area i { width:24px; height:24px; flex:none; border-radius:50%; background:var(--primary); color:#fff; font:700 12px 'Inter',sans-serif; font-style:normal; display:flex; align-items:center; justify-content:center; }
+  .gf-area-main b { display:block; font-size:13px; color:var(--ink); font-variant-numeric:tabular-nums; }
+  .gf-area-main small { display:block; font-size:11px; color:var(--muted); margin-top:1px; }
+  [data-theme="dark"] .gf-area, [data-theme="dark"] .gf-tile-btn { background:#0f172a; }
+  .gf-data { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:14px; margin-bottom:16px; }
+  .gf-data-head { display:flex; justify-content:space-between; align-items:baseline; font-size:13px; color:var(--ink); margin-bottom:4px; }
+  .gf-data-count { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .gf-data small { display:block; color:var(--muted); font-size:11px; line-height:1.4; }
+  .gf-data-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .gf-data-actions button { min-height:38px; padding:0 14px; border:none; border-radius:10px; background:#e2e8f0; color:#334155; font:600 12px 'Inter',system-ui,sans-serif; cursor:pointer; }
+  .gf-data-actions button:hover:not(:disabled) { background:#cbd5e1; }
+  .gf-data-actions button:disabled { opacity:.5; cursor:not-allowed; }
+  .gf-data-actions button.warn { background:#fee2e2; color:#b91c1c; margin-left:auto; }
+  [data-theme="dark"] .gf-data-actions button { background:#1e293b; color:#e2e8f0; }
+  [data-theme="dark"] .gf-data-actions button:hover:not(:disabled) { background:#273449; }
+  [data-theme="dark"] .gf-data-actions button.warn { background:#450a0a; color:#fecaca; }
   .gf-badge { padding:7px 12px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.3px; }
   .gf-badge.on { background:#dcfce7; color:#166534; }
   .gf-badge.off { background:#f1f5f9; color:#475569; }
